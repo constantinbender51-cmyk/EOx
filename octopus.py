@@ -6,13 +6,15 @@ Equal Opportunity: Dual Account Grid System
 - Symbol: FF_XBTUSD_260227
 - Sizing: Min(Equity1, Equity2) / 10 per level.
 - Interval: 10 Minutes
-- Debug: Full API Response Logging
+- Fix: Dynamic Precision (tickSize & tradePrecision)
 """
 
 import os
 import sys
 import time
 import logging
+import requests
+import math
 from kraken_futures import KrakenFuturesApi
 from dotenv import load_dotenv
 
@@ -57,10 +59,49 @@ class EqualOpportunityBot:
                 sys.exit(1)
             self.clients[name] = KrakenFuturesApi(creds["key"], creds["secret"])
         
+        # Default Specs (Updated on start)
+        self.tick_size = 0.5
+        self.qty_step = 0.0001
+        self.min_qty = 0.0001
+        self.fetch_specs()
+
+    def fetch_specs(self):
+        """Fetch instrument precision settings to avoid invalidSize/Price errors."""
+        try:
+            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
+            resp = requests.get(url).json()
+            if "instruments" in resp:
+                for inst in resp["instruments"]:
+                    if inst["symbol"].upper() == SYMBOL:
+                        # Price Step
+                        self.tick_size = float(inst.get("tickSize", 0.5))
+                        
+                        # Quantity Step (Precision)
+                        precision = inst.get("contractValueTradePrecision", 3)
+                        self.qty_step = 10 ** (-int(precision))
+                        
+                        # Min Order Size (Sometimes in separate field, safe fallback to step)
+                        self.min_qty = self.qty_step
+                        
+                        logger.info(f"SPECS | Tick: {self.tick_size} | QtyStep: {self.qty_step}")
+                        return
+        except Exception as e:
+            logger.warning(f"Spec Fetch Failed, using defaults: {e}")
+
+    def round_price(self, price):
+        """Round price to nearest tickSize."""
+        steps = round(price / self.tick_size)
+        return steps * self.tick_size
+
+    def round_qty(self, qty):
+        """Round quantity to contractValueTradePrecision."""
+        steps = round(qty / self.qty_step)
+        rounded = steps * self.qty_step
+        return max(rounded, self.min_qty)
+
     def get_equity(self, client):
         try:
             acc = client.get_accounts()
-            # logger.info(f"Equity RESP: {acc}") # Uncomment if equity fetch issues persist
             if "flex" in acc.get("accounts", {}):
                 return float(acc["accounts"]["flex"].get("marginEquity", 0))
             first = list(acc.get("accounts", {}).values())[0]
@@ -71,8 +112,8 @@ class EqualOpportunityBot:
 
     def cancel_all(self, client):
         try:
-            resp = client.cancel_all_orders(SYMBOL)
-            logger.info(f"Cancel RESP: {resp}")
+            client.cancel_all_orders(SYMBOL)
+            logger.info("Orders flushed.")
         except Exception as e:
             logger.error(f"Cancel Failed: {e}")
 
@@ -85,24 +126,32 @@ class EqualOpportunityBot:
         total_qty = 0.0
         orders = []
 
-        for price in config["levels"]:
-            qty = base_value / price
-            if qty < 0.0001: qty = 0.0001
+        # 2. Limit Orders
+        for raw_price in config["levels"]:
+            price = self.round_price(raw_price)
+            
+            raw_qty = base_value / price
+            qty = self.round_qty(raw_qty)
+            
             total_qty += qty
             orders.append({
                 "orderType": "lmt",
                 "symbol": SYMBOL,
                 "side": config["side"],
-                "size": round(qty, 5),
+                "size": qty,
                 "limitPrice": price
             })
 
+        # 3. Stop Loss (Must match sum of open limits)
+        stop_price = self.round_price(config["stop"])
+        stop_qty = self.round_qty(total_qty)
+        
         orders.append({
             "orderType": "stp",
             "symbol": SYMBOL,
             "side": config["stop_side"],
-            "size": round(total_qty, 5),
-            "stopPrice": config["stop"],
+            "size": stop_qty,
+            "stopPrice": stop_price,
             "reduceOnly": True
         })
 
@@ -111,10 +160,16 @@ class EqualOpportunityBot:
         for order in orders:
             try:
                 resp = client.send_order(order)
-                logger.info(f"Order RESP: {resp}")
                 
                 if "error" in resp:
-                    logger.error(f"Order Error: {resp}")
+                    logger.error(f"Order Fail: {resp}")
+                elif "sendStatus" in resp:
+                    status = resp.get("sendStatus", {})
+                    # Check for explicit API status failure inside success packet
+                    if status.get("status") != "placed" and "order_id" not in status:
+                         logger.error(f"Order Rejected: {status}")
+                    else:
+                        logger.info(f"Placed {order['orderType']} | ID: {status.get('order_id', 'Unknown')}")
             except Exception as e:
                 logger.error(f"Order Excep: {e}")
 
@@ -132,7 +187,6 @@ class EqualOpportunityBot:
                 client = self.clients[name]
                 try:
                     open_orders = client.get_open_orders()
-                    # logger.info(f"{name} OpenOrders RESP: {open_orders}") # Too verbose for main loop usually, enable if needed
                     
                     current_count = 0
                     if "openOrders" in open_orders:
