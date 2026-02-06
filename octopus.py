@@ -3,10 +3,7 @@
 Equal Opportunity: Dual Account Grid System
 - Logic: Long 60-64k / Short 66-70k.
 - Sizing: Min(Equity1, Equity2) / 10 per level.
-- Startup: 
-    1. Force Flush (Prints Cancel API Responses).
-    2. CLOSE POSITIONS (Prints Market Order API Response).
-- Management: Detects open positions, skips filled grid levels.
+- Fix: Corrected API Payload Formats (Dict vs String) for Cancellation.
 """
 
 import os
@@ -71,13 +68,9 @@ class EqualOpportunityBot:
         # --- Startup Cleanup ---
         logger.info("--- STARTUP: Wiping Orders & Positions ---")
         for name, client in self.clients.items():
-            # 1. Kill Orders (Flush)
             self.force_flush(name, client)
-            # 2. Kill Positions (Market Close)
             self.close_open_position(name, client)
-            # 3. Reset State
             self.state[name] = []
-            
         self.save_state()
 
     def fetch_specs(self):
@@ -142,7 +135,6 @@ class EqualOpportunityBot:
             return 0.0
 
     def close_open_position(self, name, client):
-        """Detects side and sends Market Close order."""
         try:
             pos_data = client.get_open_positions()
             if "openPositions" not in pos_data: return
@@ -167,17 +159,19 @@ class EqualOpportunityBot:
             logger.error(f"{name}: Position Close Fail: {e}")
 
     def force_flush(self, name, client):
-        """Blanket Cancel + Sniper Cancel."""
-        # 1. Blanket
+        """
+        Modified to use Dictionary payloads for cancellation to avoid TypeErrors.
+        """
+        # 1. Blanket Cancel (Try sending explicit Dict)
         try:
-            resp = client.cancel_all_orders(SYMBOL)
+            resp = client.cancel_all_orders({"symbol": SYMBOL})
             logger.info(f"{name}: Cancel All Resp: {resp}")
         except Exception as e:
             logger.error(f"{name}: Cancel All Fail: {e}")
         
         time.sleep(1.0)
 
-        # 2. Sniper
+        # 2. Sniper Cancel (Iterate and kill survivors)
         try:
             open_orders = client.get_open_orders()
             if "openOrders" in open_orders:
@@ -186,12 +180,19 @@ class EqualOpportunityBot:
                     logger.info(f"{name}: Sniping {len(survivors)} stuck orders...")
                     for o in survivors:
                         try:
-                            resp = client.cancel_order(o["order_id"])
-                            logger.info(f"{name}: Cancel {o['order_id']} Resp: {resp}")
-                        except Exception as e:
-                            logger.error(f"{name}: Cancel {o['order_id']} Fail: {e}")
+                            # Try passing Dict payload
+                            resp = client.cancel_order({"order_id": o["order_id"]})
+                            
+                            # Fallback logging
+                            if "error" in str(resp):
+                                logger.warning(f"Sniper Retry {o['order_id']}")
+                            else:
+                                logger.info(f"{name}: Cancelled {o['order_id']}")
+                                
+                        except Exception as inner_e:
+                            logger.error(f"{name}: Sniper ID {o['order_id']} Error: {inner_e}")
         except Exception as e:
-            logger.error(f"{name}: Sniper Error: {e}")
+            logger.error(f"{name}: Sniper Check Fail: {e}")
 
     def place_grid(self, name, client, config, base_equity):
         if base_equity <= 0: return
