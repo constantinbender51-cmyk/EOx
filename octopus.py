@@ -3,8 +3,10 @@
 Equal Opportunity: Dual Account Grid System
 - Logic: Long 60-64k / Short 66-70k.
 - Sizing: Min(Equity1, Equity2) / 10 per level.
-- Startup: Closes all open orders immediately.
-- Management: Detects open positions, skips filled grid levels, updates Stop Loss.
+- Startup: 
+    1. Force Flush (Double-Tap Cancel).
+    2. CLOSE ANY OPEN POSITIONS (Market Flat).
+- Management: Detects open positions, skips filled grid levels.
 """
 
 import os
@@ -67,10 +69,15 @@ class EqualOpportunityBot:
         self.fetch_specs()
         
         # --- Startup Cleanup ---
-        logger.info("--- STARTUP: Cleaning Orders ---")
+        logger.info("--- STARTUP: Wiping Orders & Positions ---")
         for name, client in self.clients.items():
-            self.cancel_all(client)
+            # 1. Kill Orders
+            self.force_flush(name, client)
+            # 2. Kill Positions
+            self.close_open_position(name, client)
+            # 3. Reset State
             self.state[name] = []
+            
         self.save_state()
 
     def fetch_specs(self):
@@ -125,58 +132,84 @@ class EqualOpportunityBot:
             return 0.0
 
     def get_position(self, client):
+        """Returns size (absolute) for calculation usage."""
         try:
             pos = client.get_open_positions()
             for p in pos.get("openPositions", []):
                 if p["symbol"].upper() == SYMBOL:
-                    size = float(p["size"])
-                    # Return absolute size, direction is implied by account config
-                    return size
+                    return float(p["size"])
             return 0.0
         except Exception:
             return 0.0
 
-    def cancel_all(self, client):
+    def close_open_position(self, name, client):
+        """Detects side and sends Market Close order."""
+        try:
+            pos_data = client.get_open_positions()
+            if "openPositions" not in pos_data: return
+
+            for p in pos_data["openPositions"]:
+                if p["symbol"].upper() == SYMBOL:
+                    size = float(p["size"])
+                    if size > 0:
+                        direction = p["side"] # 'long' or 'short'
+                        exit_side = "sell" if direction == "long" else "buy"
+                        
+                        logger.info(f"{name}: Closing {direction.upper()} position of {size}...")
+                        client.send_order({
+                            "orderType": "mkt",
+                            "symbol": SYMBOL,
+                            "side": exit_side,
+                            "size": size
+                        })
+                        time.sleep(2) # Wait for fill
+        except Exception as e:
+            logger.error(f"{name}: Position Close Fail: {e}")
+
+    def force_flush(self, name, client):
+        """Blanket Cancel + Sniper Cancel."""
         try:
             client.cancel_all_orders(SYMBOL)
-            logger.info("Orders flushed.")
-        except Exception as e:
-            logger.error(f"Cancel Failed: {e}")
+            logger.info(f"{name}: Orders flushed.")
+        except Exception:
+            pass
+        
+        time.sleep(1.0)
+
+        try:
+            open_orders = client.get_open_orders()
+            if "openOrders" in open_orders:
+                survivors = [o for o in open_orders["openOrders"] if o["symbol"].upper() == SYMBOL]
+                if survivors:
+                    logger.info(f"{name}: Sniping {len(survivors)} stuck orders...")
+                    for o in survivors:
+                        try:
+                            client.cancel_order(o["order_id"])
+                        except: pass
+        except Exception:
+            pass
 
     def place_grid(self, name, client, config, base_equity):
         if base_equity <= 0: return
 
-        # 1. Get Current Reality
+        # 1. Get Current Reality (Should be 0 on startup, but handles fills later)
         current_pos = self.get_position(client)
         base_value_per_level = base_equity / 10.0
-        
-        # 2. Determine Remaining Orders
-        # We must subtract the current position from the "Limit" orders.
-        # Assumption: 
-        #   - Longs: Highest prices fill first.
-        #   - Shorts: Lowest prices fill first.
         
         levels = sorted(config["levels"], reverse=(config["side"] == "buy"))
         
         limit_payloads = []
         pending_limit_size = 0.0
         
-        # Logic: Deduct position from the "filled" side of the grid
         filled_qty_tracker = current_pos
 
         for raw_price in levels:
             price = self.round_price(raw_price)
             ideal_qty = self.round_qty(base_value_per_level / price)
             
-            if filled_qty_tracker >= (ideal_qty * 0.9): # 10% buffer for rounding
-                # This level is assumed filled
+            if filled_qty_tracker >= (ideal_qty * 0.9): 
                 filled_qty_tracker -= ideal_qty
-                # logger.info(f"{name}: Level {price} considered filled.")
             else:
-                # specific case: partial fill? unlikely with limits, but just take remaining
-                # Simplify: if we have residual pos, we skip strict deduction and just place full limit
-                # actually safer to just place the limit if we ran out of 'position' to attribute
-                
                 limit_payloads.append({
                     "orderType": "lmt",
                     "symbol": SYMBOL,
@@ -187,7 +220,6 @@ class EqualOpportunityBot:
                 })
                 pending_limit_size += ideal_qty
 
-        # 3. Stop Loss (Position + Pending)
         stop_price = self.round_price(config["stop"])
         total_risk_size = self.round_qty(current_pos + pending_limit_size)
         
@@ -204,7 +236,6 @@ class EqualOpportunityBot:
 
         logger.info(f"{name} | Pos: {current_pos:.4f} | Placing {len(limit_payloads)} limits + Stop {total_risk_size:.4f}")
 
-        # 4. Execute
         new_state = []
         for order in orders_to_send:
             try:
@@ -224,12 +255,6 @@ class EqualOpportunityBot:
         self.save_state()
 
     def check_integrity(self, name, open_orders, current_pos, min_equity, config):
-        """
-        Validates:
-        1. All saved Limit orders exist.
-        2. Saved Stop order exists.
-        3. Stop Size matches (Position + Limits) within tolerance.
-        """
         saved = self.state.get(name, [])
         if not saved: return False
         
@@ -241,7 +266,7 @@ class EqualOpportunityBot:
             if s["type"] == "limit":
                 if s["id"] not in live_map:
                     logger.info(f"{name}: Limit {s['id']} filled/gone. Resetting.")
-                    return False # Trigger reset to recalculate position/remaining
+                    return False
                 limit_size_sum += float(live_map[s["id"]]["size"])
 
         # 2. Check Stop Size matches Reality
@@ -284,9 +309,8 @@ class EqualOpportunityBot:
                         logger.info(f"{name}: OK. Pos: {pos:.4f}")
                     else:
                         logger.info(f"{name}: State Invalid. Rebuilding...")
-                        count = sum(1 for o in open_orders.get("openOrders", []) if o["symbol"].upper() == SYMBOL)
-                        if count > 0:
-                            self.cancel_all(client)
+                        # If grid is invalid, we don't close pos, we just reset orders
+                        self.force_flush(name, client)
                         self.place_grid(name, client, config, min_equity)
 
                 except Exception as e:
