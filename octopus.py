@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
 Equal Opportunity: Dual Account Grid System
-- Account 1 (Long): Buys 60-64k, Stop 59k.
-- Account 2 (Short): Sells 66-70k, Stop 71k.
-- Symbol: FF_XBTUSD_260227
+- Logic: Long 60-64k / Short 66-70k.
 - Sizing: Min(Equity1, Equity2) / 10 per level.
-- Interval: 10 Minutes
-- Fix: Dynamic Precision (tickSize & tradePrecision)
+- Integrity: Verifies Order IDs, Exact Prices, and Size Tolerance (>5%).
 """
 
 import os
@@ -14,7 +11,7 @@ import sys
 import time
 import logging
 import requests
-import math
+import json
 from kraken_futures import KrakenFuturesApi
 from dotenv import load_dotenv
 
@@ -42,6 +39,8 @@ KEYS = {
 
 SYMBOL = "FF_XBTUSD_260227".upper()
 UPDATE_INTERVAL = 600
+STATE_FILE = "order_state.json"
+SIZE_TOLERANCE = 0.05  # Reset if size drifts > 5% from ideal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +58,8 @@ class EqualOpportunityBot:
                 sys.exit(1)
             self.clients[name] = KrakenFuturesApi(creds["key"], creds["secret"])
         
+        self.state = self.load_state()
+        
         # Default Specs (Updated on start)
         self.tick_size = 0.5
         self.qty_step = 0.0001
@@ -66,35 +67,44 @@ class EqualOpportunityBot:
         self.fetch_specs()
 
     def fetch_specs(self):
-        """Fetch instrument precision settings to avoid invalidSize/Price errors."""
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
             resp = requests.get(url).json()
             if "instruments" in resp:
                 for inst in resp["instruments"]:
                     if inst["symbol"].upper() == SYMBOL:
-                        # Price Step
                         self.tick_size = float(inst.get("tickSize", 0.5))
-                        
-                        # Quantity Step (Precision)
                         precision = inst.get("contractValueTradePrecision", 3)
                         self.qty_step = 10 ** (-int(precision))
-                        
-                        # Min Order Size (Sometimes in separate field, safe fallback to step)
                         self.min_qty = self.qty_step
-                        
                         logger.info(f"SPECS | Tick: {self.tick_size} | QtyStep: {self.qty_step}")
                         return
         except Exception as e:
             logger.warning(f"Spec Fetch Failed, using defaults: {e}")
 
+    # --- Persistence ---
+    def load_state(self):
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_state(self):
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(self.state, f, indent=4)
+        except Exception as e:
+            logger.error(f"State Save Failed: {e}")
+
+    # --- Utils ---
     def round_price(self, price):
-        """Round price to nearest tickSize."""
         steps = round(price / self.tick_size)
         return steps * self.tick_size
 
     def round_qty(self, qty):
-        """Round quantity to contractValueTradePrecision."""
         steps = round(qty / self.qty_step)
         rounded = steps * self.qty_step
         return max(rounded, self.min_qty)
@@ -106,8 +116,7 @@ class EqualOpportunityBot:
                 return float(acc["accounts"]["flex"].get("marginEquity", 0))
             first = list(acc.get("accounts", {}).values())[0]
             return float(first.get("marginEquity", 0))
-        except Exception as e:
-            logger.error(f"Equity Fetch Fail: {e}")
+        except Exception:
             return 0.0
 
     def cancel_all(self, client):
@@ -117,61 +126,146 @@ class EqualOpportunityBot:
         except Exception as e:
             logger.error(f"Cancel Failed: {e}")
 
+    # --- Core Logic ---
     def place_grid(self, name, client, config, base_equity):
-        if base_equity <= 0:
-            logger.error(f"{name}: Base Equity 0. Skipping.")
-            return
+        if base_equity <= 0: return
 
         base_value = base_equity / 10.0
         total_qty = 0.0
-        orders = []
+        new_orders_state = []
+        orders_payload = []
 
-        # 2. Limit Orders
+        # 1. Prepare Limit Orders
         for raw_price in config["levels"]:
             price = self.round_price(raw_price)
-            
-            raw_qty = base_value / price
-            qty = self.round_qty(raw_qty)
-            
+            qty = self.round_qty(base_value / price)
             total_qty += qty
-            orders.append({
+            
+            orders_payload.append({
                 "orderType": "lmt",
                 "symbol": SYMBOL,
                 "side": config["side"],
                 "size": qty,
-                "limitPrice": price
+                "limitPrice": price,
+                "meta_type": "limit"
             })
 
-        # 3. Stop Loss (Must match sum of open limits)
+        # 2. Prepare Stop Loss
         stop_price = self.round_price(config["stop"])
         stop_qty = self.round_qty(total_qty)
-        
-        orders.append({
+        orders_payload.append({
             "orderType": "stp",
             "symbol": SYMBOL,
             "side": config["stop_side"],
             "size": stop_qty,
             "stopPrice": stop_price,
-            "reduceOnly": True
+            "reduceOnly": True,
+            "meta_type": "stop"
         })
 
-        logger.info(f"{name} | BaseEq: {base_equity:.2f} | Placing {len(orders)} orders.")
+        # 3. Execute & Record IDs
+        logger.info(f"{name} | Placing {len(orders_payload)} orders (Eq: {base_equity:.2f})")
         
-        for order in orders:
+        for order in orders_payload:
             try:
+                meta_type = order.pop("meta_type")
                 resp = client.send_order(order)
                 
-                if "error" in resp:
-                    logger.error(f"Order Fail: {resp}")
-                elif "sendStatus" in resp:
-                    status = resp.get("sendStatus", {})
-                    # Check for explicit API status failure inside success packet
-                    if status.get("status") != "placed" and "order_id" not in status:
-                         logger.error(f"Order Rejected: {status}")
+                if "sendStatus" in resp:
+                    status = resp["sendStatus"]
+                    if "order_id" in status:
+                        # Save State with exact values sent
+                        new_orders_state.append({
+                            "id": status["order_id"],
+                            "type": meta_type,
+                            "price": order.get("limitPrice", order.get("stopPrice")),
+                            "size": order["size"]
+                        })
                     else:
-                        logger.info(f"Placed {order['orderType']} | ID: {status.get('order_id', 'Unknown')}")
+                        logger.error(f"Order Rejected: {status}")
             except Exception as e:
                 logger.error(f"Order Excep: {e}")
+
+        # 4. Update State
+        self.state[name] = new_orders_state
+        self.save_state()
+
+    def check_grid_integrity(self, name, open_orders, min_equity, config):
+        """
+        1. Checks if saved IDs exist on exchange.
+        2. Checks if live price == saved price (Exact).
+        3. Checks if live size == ideal size (Tolerance 5%).
+        """
+        saved_orders = self.state.get(name, [])
+        if not saved_orders:
+            logger.info(f"{name}: No saved state found.")
+            return False
+
+        # Map Live Orders by ID
+        live_map = {}
+        if "openOrders" in open_orders:
+            for o in open_orders["openOrders"]:
+                live_map[o["order_id"]] = o
+
+        # Recalculate Ideal Sizing
+        base_value = min_equity / 10.0
+        total_ideal_qty = 0.0
+
+        # --- LIMIT ORDERS CHECK ---
+        for saved in saved_orders:
+            if saved["type"] == "limit":
+                oid = saved["id"]
+                
+                # 1. Existence Check
+                if oid not in live_map:
+                    logger.info(f"{name}: Limit {oid} missing (Filled/Closed). Resetting.")
+                    return False
+                
+                live_order = live_map[oid]
+                saved_price = float(saved["price"])
+                live_price = float(live_order.get("limitPrice", 0))
+                
+                # 2. Price Check (Exact)
+                if live_price != saved_price:
+                    logger.info(f"{name}: Price Mismatch. Live: {live_price}, Saved: {saved_price}. Resetting.")
+                    return False
+
+                # 3. Size Check (Drift)
+                ideal_qty = self.round_qty(base_value / saved_price)
+                total_ideal_qty += ideal_qty
+                
+                current_qty = float(live_order["size"])
+                if abs(current_qty - ideal_qty) / current_qty > SIZE_TOLERANCE:
+                    logger.info(f"{name}: Limit Size Drift > 5%. Live: {current_qty}, Ideal: {ideal_qty}. Resetting.")
+                    return False
+
+        # --- STOP LOSS CHECK ---
+        for saved in saved_orders:
+            if saved["type"] == "stop":
+                oid = saved["id"]
+                
+                if oid not in live_map:
+                    logger.info(f"{name}: Stop {oid} missing. Resetting.")
+                    return False
+                
+                live_order = live_map[oid]
+                saved_price = float(saved["price"])
+                live_price = float(live_order.get("stopPrice", 0))
+
+                # Price Check
+                if live_price != saved_price:
+                    logger.info(f"{name}: Stop Price Mismatch. Live: {live_price}, Saved: {saved_price}. Resetting.")
+                    return False
+                
+                # Size Check (Total Aggregated)
+                ideal_stop_qty = self.round_qty(total_ideal_qty)
+                current_stop_qty = float(live_order["size"])
+                
+                if abs(current_stop_qty - ideal_stop_qty) / current_stop_qty > SIZE_TOLERANCE:
+                    logger.info(f"{name}: Stop Size Drift. Live: {current_stop_qty}, Ideal: {ideal_stop_qty}. Resetting.")
+                    return False
+
+        return True
 
     def run(self):
         logger.info(f"Engine Started. Symbol: {SYMBOL}")
@@ -188,21 +282,24 @@ class EqualOpportunityBot:
                 try:
                     open_orders = client.get_open_orders()
                     
-                    current_count = 0
-                    if "openOrders" in open_orders:
-                        current_count = sum(1 for o in open_orders["openOrders"] 
-                                          if o["symbol"].upper() == SYMBOL)
-                    
-                    if current_count != 6:
-                        logger.info(f"{name}: Count {current_count}/6. Resetting.")
-                        if current_count > 0:
-                            self.cancel_all(client)
-                        self.place_grid(name, client, config, min_equity)
+                    if self.check_grid_integrity(name, open_orders, min_equity, config):
+                        logger.info(f"{name}: Grid Valid & Healthy.")
                     else:
-                        logger.info(f"{name}: Grid intact.")
+                        logger.info(f"{name}: Grid Invalid/Drifted. Rebuilding.")
                         
+                        # Safety: Cancel existing before placing new
+                        count = 0
+                        if "openOrders" in open_orders:
+                            count = sum(1 for o in open_orders["openOrders"] if o["symbol"].upper() == SYMBOL)
+                        
+                        if count > 0:
+                            self.cancel_all(client)
+                        
+                        self.state[name] = [] # Clear old state
+                        self.place_grid(name, client, config, min_equity)
+
                 except Exception as e:
-                    logger.error(f"{name} Loop Fail: {e}")
+                    logger.error(f"{name} Loop Error: {e}")
 
             time.sleep(UPDATE_INTERVAL)
 
