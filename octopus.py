@@ -5,7 +5,7 @@ Equal Opportunity: Dual Account Grid System
 - Sizing: Min(Equity1, Equity2) / 10 per level.
 - Startup: 
     1. Force Flush (Double-Tap Cancel).
-    2. CLOSE ANY OPEN POSITIONS (Market Flat).
+    2. CLOSE ANY OPEN POSITIONS (Market Flat) -> PRINTS API RESPONSE.
 - Management: Detects open positions, skips filled grid levels.
 """
 
@@ -156,12 +156,13 @@ class EqualOpportunityBot:
                         exit_side = "sell" if direction == "long" else "buy"
                         
                         logger.info(f"{name}: Closing {direction.upper()} position of {size}...")
-                        client.send_order({
+                        resp = client.send_order({
                             "orderType": "mkt",
                             "symbol": SYMBOL,
                             "side": exit_side,
                             "size": size
                         })
+                        logger.info(f"Close API Response: {resp}")
                         time.sleep(2) # Wait for fill
         except Exception as e:
             logger.error(f"{name}: Position Close Fail: {e}")
