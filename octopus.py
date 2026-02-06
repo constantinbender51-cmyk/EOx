@@ -3,8 +3,8 @@
 Equal Opportunity: Dual Account Grid System
 - Account 1 (Long): Buys 60-64k, Stop 59k.
 - Account 2 (Short): Sells 66-70k, Stop 71k.
-- Symbol: ff_btcusd_270226
-- Sizing: Equity / 10 per level (Total 0.5x leverage per side).
+- Symbol: FF_XBTUSD_260227
+- Sizing: Min(Equity1, Equity2) / 10 per level.
 """
 
 import os
@@ -36,7 +36,7 @@ KEYS = {
     }
 }
 
-SYMBOL = "ff_btcusd_270226".upper()
+SYMBOL = "FF_XBTUSD_260227"
 UPDATE_INTERVAL = 60
 
 logging.basicConfig(
@@ -55,19 +55,6 @@ class EqualOpportunityBot:
                 sys.exit(1)
             self.clients[name] = KrakenFuturesApi(creds["key"], creds["secret"])
         
-        self.min_size = 0.0001 # Default, updated via specs
-
-    def _fetch_specs(self, client):
-        try:
-            # General spec fetch, using Long client as proxy for symbol data
-            resp = client.get_tickers()
-            # Note: Ticker doesn't give precision, instruments does. 
-            # Assuming standard logic or hardcoded minimum if fetch fails.
-            # Implementation uses a safe default if API check omitted for speed.
-            pass
-        except Exception:
-            pass
-
     def get_equity(self, client):
         try:
             acc = client.get_accounts()
@@ -86,16 +73,14 @@ class EqualOpportunityBot:
         except Exception as e:
             logger.error(f"Cancel Failed: {e}")
 
-    def place_grid(self, name, client, config):
-        equity = self.get_equity(client)
-        if equity <= 0:
-            logger.error(f"{name}: Equity 0/Unavailable.")
+    def place_grid(self, name, client, config, base_equity):
+        if base_equity <= 0:
+            logger.error(f"{name}: Base Equity 0. Skipping.")
             return
 
-        # 1. Calculate Size
-        # Value per order = Equity / 10
-        # Qty = Value / Price
-        base_value = equity / 10.0
+        # 1. Calculate Size using Min Equity
+        # Value per order = Min(ME) / 10
+        base_value = base_equity / 10.0
         total_qty = 0.0
 
         orders = []
@@ -103,7 +88,7 @@ class EqualOpportunityBot:
         # 2. Limit Orders
         for price in config["levels"]:
             qty = base_value / price
-            # Ensure min size (assuming 0.0001 for BTC derivatives usually)
+            # Ensure min size (assuming 0.0001)
             if qty < 0.0001: qty = 0.0001
             
             total_qty += qty
@@ -116,22 +101,18 @@ class EqualOpportunityBot:
             })
 
         # 3. Stop Loss
-        # Stop size equals sum of all limit orders to cover full fill
         orders.append({
             "orderType": "stp",
             "symbol": SYMBOL,
             "side": config["stop_side"],
             "size": round(total_qty, 5),
             "stopPrice": config["stop"],
-            "reduceOnly": True # Critical to prevent opening opposite position
+            "reduceOnly": True
         })
 
         # 4. Execution
-        logger.info(f"{name} | Equity: {equity:.2f} | Placing {len(orders)} orders.")
+        logger.info(f"{name} | BaseEq: {base_equity:.2f} | Placing {len(orders)} orders.")
         
-        # Batch execute if supported, else sequential
-        # Kraken Futures batch order support varies by lib wrapper. 
-        # Using sequential for safety with generic wrapper assumption.
         for order in orders:
             try:
                 resp = client.send_order(order)
@@ -144,26 +125,34 @@ class EqualOpportunityBot:
         logger.info(f"Engine Started. Symbol: {SYMBOL}")
         
         while True:
+            # 1. Fetch Equities
+            eq_long = self.get_equity(self.clients["LONG"])
+            eq_short = self.get_equity(self.clients["SHORT"])
+            
+            # 2. Determine Min Equity
+            min_equity = min(eq_long, eq_short)
+            logger.info(f"Equities | LONG: {eq_long:.2f} | SHORT: {eq_short:.2f} | MIN: {min_equity:.2f}")
+
+            # 3. Process Accounts
             for name, config in KEYS.items():
                 client = self.clients[name]
                 
-                # Check existing orders to avoid spamming
                 try:
                     open_orders = client.get_open_orders()
                     current_count = 0
                     if "openOrders" in open_orders:
                         current_count = sum(1 for o in open_orders["openOrders"] if o["symbol"] == SYMBOL)
                     
-                    # If we don't have exactly 6 orders (5 limits + 1 stop), reset
+                    # Reset if count incorrect (5 limits + 1 stop = 6)
                     if current_count != 6:
-                        logger.info(f"{name}: Order count mismatch ({current_count}/6). Resetting grid.")
+                        logger.info(f"{name}: Count {current_count}/6. Resetting.")
                         self.cancel_all(client)
-                        self.place_grid(name, client, config)
+                        self.place_grid(name, client, config, min_equity)
                     else:
                         logger.info(f"{name}: Grid intact.")
                         
                 except Exception as e:
-                    logger.error(f"{name} Check Fail: {e}")
+                    logger.error(f"{name} Loop Fail: {e}")
 
             time.sleep(UPDATE_INTERVAL)
 
