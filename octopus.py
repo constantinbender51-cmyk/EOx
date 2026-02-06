@@ -3,7 +3,8 @@
 Equal Opportunity: Dual Account Grid System
 - Logic: Long 60-64k / Short 66-70k.
 - Sizing: Min(Equity1, Equity2) / 10 per level.
-- Integrity: Verifies Order IDs, Exact Prices, and Size Tolerance (>5%).
+- Startup: Closes all open orders immediately.
+- Management: Detects open positions, skips filled grid levels, updates Stop Loss.
 """
 
 import os
@@ -12,6 +13,7 @@ import time
 import logging
 import requests
 import json
+import math
 from kraken_futures import KrakenFuturesApi
 from dotenv import load_dotenv
 
@@ -40,7 +42,7 @@ KEYS = {
 SYMBOL = "FF_XBTUSD_260227".upper()
 UPDATE_INTERVAL = 600
 STATE_FILE = "order_state.json"
-SIZE_TOLERANCE = 0.05  # Reset if size drifts > 5% from ideal
+SIZE_TOLERANCE = 0.05
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,12 +61,17 @@ class EqualOpportunityBot:
             self.clients[name] = KrakenFuturesApi(creds["key"], creds["secret"])
         
         self.state = self.load_state()
-        
-        # Default Specs (Updated on start)
         self.tick_size = 0.5
         self.qty_step = 0.0001
         self.min_qty = 0.0001
         self.fetch_specs()
+        
+        # --- Startup Cleanup ---
+        logger.info("--- STARTUP: Cleaning Orders ---")
+        for name, client in self.clients.items():
+            self.cancel_all(client)
+            self.state[name] = []
+        self.save_state()
 
     def fetch_specs(self):
         try:
@@ -82,7 +89,6 @@ class EqualOpportunityBot:
         except Exception as e:
             logger.warning(f"Spec Fetch Failed, using defaults: {e}")
 
-    # --- Persistence ---
     def load_state(self):
         if os.path.exists(STATE_FILE):
             try:
@@ -96,10 +102,9 @@ class EqualOpportunityBot:
         try:
             with open(STATE_FILE, "w") as f:
                 json.dump(self.state, f, indent=4)
-        except Exception as e:
-            logger.error(f"State Save Failed: {e}")
+        except Exception:
+            pass
 
-    # --- Utils ---
     def round_price(self, price):
         steps = round(price / self.tick_size)
         return steps * self.tick_size
@@ -119,6 +124,18 @@ class EqualOpportunityBot:
         except Exception:
             return 0.0
 
+    def get_position(self, client):
+        try:
+            pos = client.get_open_positions()
+            for p in pos.get("openPositions", []):
+                if p["symbol"].upper() == SYMBOL:
+                    size = float(p["size"])
+                    # Return absolute size, direction is implied by account config
+                    return size
+            return 0.0
+        except Exception:
+            return 0.0
+
     def cancel_all(self, client):
         try:
             client.cancel_all_orders(SYMBOL)
@@ -126,180 +143,154 @@ class EqualOpportunityBot:
         except Exception as e:
             logger.error(f"Cancel Failed: {e}")
 
-    # --- Core Logic ---
     def place_grid(self, name, client, config, base_equity):
         if base_equity <= 0: return
 
-        base_value = base_equity / 10.0
-        total_qty = 0.0
-        new_orders_state = []
-        orders_payload = []
+        # 1. Get Current Reality
+        current_pos = self.get_position(client)
+        base_value_per_level = base_equity / 10.0
+        
+        # 2. Determine Remaining Orders
+        # We must subtract the current position from the "Limit" orders.
+        # Assumption: 
+        #   - Longs: Highest prices fill first.
+        #   - Shorts: Lowest prices fill first.
+        
+        levels = sorted(config["levels"], reverse=(config["side"] == "buy"))
+        
+        limit_payloads = []
+        pending_limit_size = 0.0
+        
+        # Logic: Deduct position from the "filled" side of the grid
+        filled_qty_tracker = current_pos
 
-        # 1. Prepare Limit Orders
-        for raw_price in config["levels"]:
+        for raw_price in levels:
             price = self.round_price(raw_price)
-            qty = self.round_qty(base_value / price)
-            total_qty += qty
+            ideal_qty = self.round_qty(base_value_per_level / price)
             
-            orders_payload.append({
-                "orderType": "lmt",
-                "symbol": SYMBOL,
-                "side": config["side"],
-                "size": qty,
-                "limitPrice": price,
-                "meta_type": "limit"
-            })
+            if filled_qty_tracker >= (ideal_qty * 0.9): # 10% buffer for rounding
+                # This level is assumed filled
+                filled_qty_tracker -= ideal_qty
+                # logger.info(f"{name}: Level {price} considered filled.")
+            else:
+                # specific case: partial fill? unlikely with limits, but just take remaining
+                # Simplify: if we have residual pos, we skip strict deduction and just place full limit
+                # actually safer to just place the limit if we ran out of 'position' to attribute
+                
+                limit_payloads.append({
+                    "orderType": "lmt",
+                    "symbol": SYMBOL,
+                    "side": config["side"],
+                    "size": ideal_qty,
+                    "limitPrice": price,
+                    "meta_type": "limit"
+                })
+                pending_limit_size += ideal_qty
 
-        # 2. Prepare Stop Loss
+        # 3. Stop Loss (Position + Pending)
         stop_price = self.round_price(config["stop"])
-        stop_qty = self.round_qty(total_qty)
-        orders_payload.append({
+        total_risk_size = self.round_qty(current_pos + pending_limit_size)
+        
+        orders_to_send = limit_payloads
+        orders_to_send.append({
             "orderType": "stp",
             "symbol": SYMBOL,
             "side": config["stop_side"],
-            "size": stop_qty,
+            "size": total_risk_size,
             "stopPrice": stop_price,
             "reduceOnly": True,
             "meta_type": "stop"
         })
 
-        # 3. Execute & Record IDs
-        logger.info(f"{name} | Placing {len(orders_payload)} orders (Eq: {base_equity:.2f})")
-        
-        for order in orders_payload:
+        logger.info(f"{name} | Pos: {current_pos:.4f} | Placing {len(limit_payloads)} limits + Stop {total_risk_size:.4f}")
+
+        # 4. Execute
+        new_state = []
+        for order in orders_to_send:
             try:
-                meta_type = order.pop("meta_type")
+                meta = order.pop("meta_type")
                 resp = client.send_order(order)
-                
-                if "sendStatus" in resp:
-                    status = resp["sendStatus"]
-                    if "order_id" in status:
-                        # Save State with exact values sent
-                        new_orders_state.append({
-                            "id": status["order_id"],
-                            "type": meta_type,
-                            "price": order.get("limitPrice", order.get("stopPrice")),
-                            "size": order["size"]
-                        })
-                    else:
-                        logger.error(f"Order Rejected: {status}")
+                if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
+                    new_state.append({
+                        "id": resp["sendStatus"]["order_id"],
+                        "type": meta,
+                        "price": order.get("limitPrice", order.get("stopPrice")),
+                        "size": order["size"]
+                    })
             except Exception as e:
                 logger.error(f"Order Excep: {e}")
-
-        # 4. Update State
-        self.state[name] = new_orders_state
+        
+        self.state[name] = new_state
         self.save_state()
 
-    def check_grid_integrity(self, name, open_orders, min_equity, config):
+    def check_integrity(self, name, open_orders, current_pos, min_equity, config):
         """
-        1. Checks if saved IDs exist on exchange.
-        2. Checks if live price == saved price (Exact).
-        3. Checks if live size == ideal size (Tolerance 5%).
+        Validates:
+        1. All saved Limit orders exist.
+        2. Saved Stop order exists.
+        3. Stop Size matches (Position + Limits) within tolerance.
         """
-        saved_orders = self.state.get(name, [])
-        if not saved_orders:
-            logger.info(f"{name}: No saved state found.")
+        saved = self.state.get(name, [])
+        if not saved: return False
+        
+        live_map = {o["order_id"]: o for o in open_orders.get("openOrders", [])}
+        
+        # 1. Check Limits exist
+        limit_size_sum = 0.0
+        for s in saved:
+            if s["type"] == "limit":
+                if s["id"] not in live_map:
+                    logger.info(f"{name}: Limit {s['id']} filled/gone. Resetting.")
+                    return False # Trigger reset to recalculate position/remaining
+                limit_size_sum += float(live_map[s["id"]]["size"])
+
+        # 2. Check Stop Size matches Reality
+        target_stop_size = self.round_qty(current_pos + limit_size_sum)
+        
+        stop_found = False
+        for s in saved:
+            if s["type"] == "stop":
+                if s["id"] not in live_map:
+                    logger.info(f"{name}: Stop {s['id']} missing. Resetting.")
+                    return False
+                
+                live_size = float(live_map[s["id"]]["size"])
+                if abs(live_size - target_stop_size) / live_size > SIZE_TOLERANCE:
+                     logger.info(f"{name}: Stop Size Drift. Live: {live_size}, Target: {target_stop_size}. Resetting.")
+                     return False
+                stop_found = True
+        
+        if not stop_found:
             return False
-
-        # Map Live Orders by ID
-        live_map = {}
-        if "openOrders" in open_orders:
-            for o in open_orders["openOrders"]:
-                live_map[o["order_id"]] = o
-
-        # Recalculate Ideal Sizing
-        base_value = min_equity / 10.0
-        total_ideal_qty = 0.0
-
-        # --- LIMIT ORDERS CHECK ---
-        for saved in saved_orders:
-            if saved["type"] == "limit":
-                oid = saved["id"]
-                
-                # 1. Existence Check
-                if oid not in live_map:
-                    logger.info(f"{name}: Limit {oid} missing (Filled/Closed). Resetting.")
-                    return False
-                
-                live_order = live_map[oid]
-                saved_price = float(saved["price"])
-                live_price = float(live_order.get("limitPrice", 0))
-                
-                # 2. Price Check (Exact)
-                if live_price != saved_price:
-                    logger.info(f"{name}: Price Mismatch. Live: {live_price}, Saved: {saved_price}. Resetting.")
-                    return False
-
-                # 3. Size Check (Drift)
-                ideal_qty = self.round_qty(base_value / saved_price)
-                total_ideal_qty += ideal_qty
-                
-                current_qty = float(live_order["size"])
-                if abs(current_qty - ideal_qty) / current_qty > SIZE_TOLERANCE:
-                    logger.info(f"{name}: Limit Size Drift > 5%. Live: {current_qty}, Ideal: {ideal_qty}. Resetting.")
-                    return False
-
-        # --- STOP LOSS CHECK ---
-        for saved in saved_orders:
-            if saved["type"] == "stop":
-                oid = saved["id"]
-                
-                if oid not in live_map:
-                    logger.info(f"{name}: Stop {oid} missing. Resetting.")
-                    return False
-                
-                live_order = live_map[oid]
-                saved_price = float(saved["price"])
-                live_price = float(live_order.get("stopPrice", 0))
-
-                # Price Check
-                if live_price != saved_price:
-                    logger.info(f"{name}: Stop Price Mismatch. Live: {live_price}, Saved: {saved_price}. Resetting.")
-                    return False
-                
-                # Size Check (Total Aggregated)
-                ideal_stop_qty = self.round_qty(total_ideal_qty)
-                current_stop_qty = float(live_order["size"])
-                
-                if abs(current_stop_qty - ideal_stop_qty) / current_stop_qty > SIZE_TOLERANCE:
-                    logger.info(f"{name}: Stop Size Drift. Live: {current_stop_qty}, Ideal: {ideal_stop_qty}. Resetting.")
-                    return False
 
         return True
 
     def run(self):
-        logger.info(f"Engine Started. Symbol: {SYMBOL}")
-        
+        logger.info(f"Engine Running. Symbol: {SYMBOL}")
         while True:
             eq_long = self.get_equity(self.clients["LONG"])
             eq_short = self.get_equity(self.clients["SHORT"])
             min_equity = min(eq_long, eq_short)
             
-            logger.info(f"Equities | LONG: {eq_long:.2f} | SHORT: {eq_short:.2f} | MIN: {min_equity:.2f}")
+            logger.info(f"Status | MIN EQ: {min_equity:.2f}")
 
             for name, config in KEYS.items():
                 client = self.clients[name]
                 try:
                     open_orders = client.get_open_orders()
+                    pos = self.get_position(client)
                     
-                    if self.check_grid_integrity(name, open_orders, min_equity, config):
-                        logger.info(f"{name}: Grid Valid & Healthy.")
+                    if self.check_integrity(name, open_orders, pos, min_equity, config):
+                        logger.info(f"{name}: OK. Pos: {pos:.4f}")
                     else:
-                        logger.info(f"{name}: Grid Invalid/Drifted. Rebuilding.")
-                        
-                        # Safety: Cancel existing before placing new
-                        count = 0
-                        if "openOrders" in open_orders:
-                            count = sum(1 for o in open_orders["openOrders"] if o["symbol"].upper() == SYMBOL)
-                        
+                        logger.info(f"{name}: State Invalid. Rebuilding...")
+                        count = sum(1 for o in open_orders.get("openOrders", []) if o["symbol"].upper() == SYMBOL)
                         if count > 0:
                             self.cancel_all(client)
-                        
-                        self.state[name] = [] # Clear old state
                         self.place_grid(name, client, config, min_equity)
 
                 except Exception as e:
-                    logger.error(f"{name} Loop Error: {e}")
+                    logger.error(f"{name} Error: {e}")
 
             time.sleep(UPDATE_INTERVAL)
 
