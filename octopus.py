@@ -5,6 +5,7 @@ Equal Opportunity: Dual Account Grid System
 - Account 2 (Short): Sells 66-70k, Stop 71k.
 - Symbol: FF_XBTUSD_260227
 - Sizing: Min(Equity1, Equity2) / 10 per level.
+- Interval: 10 Minutes
 """
 
 import os
@@ -36,8 +37,8 @@ KEYS = {
     }
 }
 
-SYMBOL = "FF_XBTUSD_260227"
-UPDATE_INTERVAL = 60
+SYMBOL = "FF_XBTUSD_260227".upper()
+UPDATE_INTERVAL = 600
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +69,8 @@ class EqualOpportunityBot:
 
     def cancel_all(self, client):
         try:
+            # Try passing symbol as keyword if positional fails, or just standard
+            # Some wrappers fail if you pass a string to a list expectation
             client.cancel_all_orders(SYMBOL)
             logger.info("Orders flushed.")
         except Exception as e:
@@ -79,7 +82,6 @@ class EqualOpportunityBot:
             return
 
         # 1. Calculate Size using Min Equity
-        # Value per order = Min(ME) / 10
         base_value = base_equity / 10.0
         total_qty = 0.0
 
@@ -88,7 +90,7 @@ class EqualOpportunityBot:
         # 2. Limit Orders
         for price in config["levels"]:
             qty = base_value / price
-            # Ensure min size (assuming 0.0001)
+            # Ensure min size 
             if qty < 0.0001: qty = 0.0001
             
             total_qty += qty
@@ -117,7 +119,11 @@ class EqualOpportunityBot:
             try:
                 resp = client.send_order(order)
                 if "error" in resp:
-                    logger.error(f"Order Fail {order['orderType']}@{order.get('limitPrice', order.get('stopPrice'))}: {resp}")
+                    logger.error(f"Order Fail: {resp}")
+                elif "sendStatus" in resp:
+                    # Log success to verify placement
+                    status = resp.get("sendStatus", {})
+                    logger.info(f"Placed {order['orderType']} | ID: {status.get('order_id', 'Unknown')}")
             except Exception as e:
                 logger.error(f"Order Excep: {e}")
 
@@ -140,13 +146,20 @@ class EqualOpportunityBot:
                 try:
                     open_orders = client.get_open_orders()
                     current_count = 0
+                    
                     if "openOrders" in open_orders:
-                        current_count = sum(1 for o in open_orders["openOrders"] if o["symbol"] == SYMBOL)
+                        # Normalize symbol check with upper()
+                        current_count = sum(1 for o in open_orders["openOrders"] 
+                                          if o["symbol"].upper() == SYMBOL)
                     
                     # Reset if count incorrect (5 limits + 1 stop = 6)
                     if current_count != 6:
                         logger.info(f"{name}: Count {current_count}/6. Resetting.")
-                        self.cancel_all(client)
+                        
+                        # FIX: Only cancel if there are orders to cancel
+                        if current_count > 0:
+                            self.cancel_all(client)
+                            
                         self.place_grid(name, client, config, min_equity)
                     else:
                         logger.info(f"{name}: Grid intact.")
