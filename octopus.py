@@ -6,6 +6,7 @@ Equal Opportunity: Dual Account Grid System
 - Symbol: FF_XBTUSD_260227
 - Sizing: Min(Equity1, Equity2) / 10 per level.
 - Interval: 10 Minutes
+- Debug: Full API Response Logging
 """
 
 import os
@@ -59,6 +60,7 @@ class EqualOpportunityBot:
     def get_equity(self, client):
         try:
             acc = client.get_accounts()
+            # logger.info(f"Equity RESP: {acc}") # Uncomment if equity fetch issues persist
             if "flex" in acc.get("accounts", {}):
                 return float(acc["accounts"]["flex"].get("marginEquity", 0))
             first = list(acc.get("accounts", {}).values())[0]
@@ -69,10 +71,8 @@ class EqualOpportunityBot:
 
     def cancel_all(self, client):
         try:
-            # Try passing symbol as keyword if positional fails, or just standard
-            # Some wrappers fail if you pass a string to a list expectation
-            client.cancel_all_orders(SYMBOL)
-            logger.info("Orders flushed.")
+            resp = client.cancel_all_orders(SYMBOL)
+            logger.info(f"Cancel RESP: {resp}")
         except Exception as e:
             logger.error(f"Cancel Failed: {e}")
 
@@ -81,18 +81,13 @@ class EqualOpportunityBot:
             logger.error(f"{name}: Base Equity 0. Skipping.")
             return
 
-        # 1. Calculate Size using Min Equity
         base_value = base_equity / 10.0
         total_qty = 0.0
-
         orders = []
 
-        # 2. Limit Orders
         for price in config["levels"]:
             qty = base_value / price
-            # Ensure min size 
             if qty < 0.0001: qty = 0.0001
-            
             total_qty += qty
             orders.append({
                 "orderType": "lmt",
@@ -102,7 +97,6 @@ class EqualOpportunityBot:
                 "limitPrice": price
             })
 
-        # 3. Stop Loss
         orders.append({
             "orderType": "stp",
             "symbol": SYMBOL,
@@ -112,18 +106,15 @@ class EqualOpportunityBot:
             "reduceOnly": True
         })
 
-        # 4. Execution
         logger.info(f"{name} | BaseEq: {base_equity:.2f} | Placing {len(orders)} orders.")
         
         for order in orders:
             try:
                 resp = client.send_order(order)
+                logger.info(f"Order RESP: {resp}")
+                
                 if "error" in resp:
-                    logger.error(f"Order Fail: {resp}")
-                elif "sendStatus" in resp:
-                    # Log success to verify placement
-                    status = resp.get("sendStatus", {})
-                    logger.info(f"Placed {order['orderType']} | ID: {status.get('order_id', 'Unknown')}")
+                    logger.error(f"Order Error: {resp}")
             except Exception as e:
                 logger.error(f"Order Excep: {e}")
 
@@ -131,35 +122,27 @@ class EqualOpportunityBot:
         logger.info(f"Engine Started. Symbol: {SYMBOL}")
         
         while True:
-            # 1. Fetch Equities
             eq_long = self.get_equity(self.clients["LONG"])
             eq_short = self.get_equity(self.clients["SHORT"])
-            
-            # 2. Determine Min Equity
             min_equity = min(eq_long, eq_short)
+            
             logger.info(f"Equities | LONG: {eq_long:.2f} | SHORT: {eq_short:.2f} | MIN: {min_equity:.2f}")
 
-            # 3. Process Accounts
             for name, config in KEYS.items():
                 client = self.clients[name]
-                
                 try:
                     open_orders = client.get_open_orders()
-                    current_count = 0
+                    # logger.info(f"{name} OpenOrders RESP: {open_orders}") # Too verbose for main loop usually, enable if needed
                     
+                    current_count = 0
                     if "openOrders" in open_orders:
-                        # Normalize symbol check with upper()
                         current_count = sum(1 for o in open_orders["openOrders"] 
                                           if o["symbol"].upper() == SYMBOL)
                     
-                    # Reset if count incorrect (5 limits + 1 stop = 6)
                     if current_count != 6:
                         logger.info(f"{name}: Count {current_count}/6. Resetting.")
-                        
-                        # FIX: Only cancel if there are orders to cancel
                         if current_count > 0:
                             self.cancel_all(client)
-                            
                         self.place_grid(name, client, config, min_equity)
                     else:
                         logger.info(f"{name}: Grid intact.")
