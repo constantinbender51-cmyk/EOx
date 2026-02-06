@@ -4,8 +4,8 @@ Equal Opportunity: Dual Account Grid System
 - Logic: Long 60-64k / Short 66-70k.
 - Sizing: Min(Equity1, Equity2) / 10 per level.
 - Startup: 
-    1. Force Flush (Double-Tap Cancel).
-    2. CLOSE ANY OPEN POSITIONS (Market Flat) -> PRINTS API RESPONSE.
+    1. Force Flush (Prints Cancel API Responses).
+    2. CLOSE POSITIONS (Prints Market Order API Response).
 - Management: Detects open positions, skips filled grid levels.
 """
 
@@ -71,9 +71,9 @@ class EqualOpportunityBot:
         # --- Startup Cleanup ---
         logger.info("--- STARTUP: Wiping Orders & Positions ---")
         for name, client in self.clients.items():
-            # 1. Kill Orders
+            # 1. Kill Orders (Flush)
             self.force_flush(name, client)
-            # 2. Kill Positions
+            # 2. Kill Positions (Market Close)
             self.close_open_position(name, client)
             # 3. Reset State
             self.state[name] = []
@@ -132,7 +132,6 @@ class EqualOpportunityBot:
             return 0.0
 
     def get_position(self, client):
-        """Returns size (absolute) for calculation usage."""
         try:
             pos = client.get_open_positions()
             for p in pos.get("openPositions", []):
@@ -152,7 +151,7 @@ class EqualOpportunityBot:
                 if p["symbol"].upper() == SYMBOL:
                     size = float(p["size"])
                     if size > 0:
-                        direction = p["side"] # 'long' or 'short'
+                        direction = p["side"]
                         exit_side = "sell" if direction == "long" else "buy"
                         
                         logger.info(f"{name}: Closing {direction.upper()} position of {size}...")
@@ -162,21 +161,23 @@ class EqualOpportunityBot:
                             "side": exit_side,
                             "size": size
                         })
-                        logger.info(f"Close API Response: {resp}")
-                        time.sleep(2) # Wait for fill
+                        logger.info(f"{name}: Close Position Resp: {resp}")
+                        time.sleep(2)
         except Exception as e:
             logger.error(f"{name}: Position Close Fail: {e}")
 
     def force_flush(self, name, client):
         """Blanket Cancel + Sniper Cancel."""
+        # 1. Blanket
         try:
-            client.cancel_all_orders(SYMBOL)
-            logger.info(f"{name}: Orders flushed.")
-        except Exception:
-            pass
+            resp = client.cancel_all_orders(SYMBOL)
+            logger.info(f"{name}: Cancel All Resp: {resp}")
+        except Exception as e:
+            logger.error(f"{name}: Cancel All Fail: {e}")
         
         time.sleep(1.0)
 
+        # 2. Sniper
         try:
             open_orders = client.get_open_orders()
             if "openOrders" in open_orders:
@@ -185,15 +186,16 @@ class EqualOpportunityBot:
                     logger.info(f"{name}: Sniping {len(survivors)} stuck orders...")
                     for o in survivors:
                         try:
-                            client.cancel_order(o["order_id"])
-                        except: pass
-        except Exception:
-            pass
+                            resp = client.cancel_order(o["order_id"])
+                            logger.info(f"{name}: Cancel {o['order_id']} Resp: {resp}")
+                        except Exception as e:
+                            logger.error(f"{name}: Cancel {o['order_id']} Fail: {e}")
+        except Exception as e:
+            logger.error(f"{name}: Sniper Error: {e}")
 
     def place_grid(self, name, client, config, base_equity):
         if base_equity <= 0: return
 
-        # 1. Get Current Reality (Should be 0 on startup, but handles fills later)
         current_pos = self.get_position(client)
         base_value_per_level = base_equity / 10.0
         
@@ -261,7 +263,6 @@ class EqualOpportunityBot:
         
         live_map = {o["order_id"]: o for o in open_orders.get("openOrders", [])}
         
-        # 1. Check Limits exist
         limit_size_sum = 0.0
         for s in saved:
             if s["type"] == "limit":
@@ -270,7 +271,6 @@ class EqualOpportunityBot:
                     return False
                 limit_size_sum += float(live_map[s["id"]]["size"])
 
-        # 2. Check Stop Size matches Reality
         target_stop_size = self.round_qty(current_pos + limit_size_sum)
         
         stop_found = False
@@ -310,7 +310,6 @@ class EqualOpportunityBot:
                         logger.info(f"{name}: OK. Pos: {pos:.4f}")
                     else:
                         logger.info(f"{name}: State Invalid. Rebuilding...")
-                        # If grid is invalid, we don't close pos, we just reset orders
                         self.force_flush(name, client)
                         self.place_grid(name, client, config, min_equity)
 
