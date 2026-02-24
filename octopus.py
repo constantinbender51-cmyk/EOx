@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
 PEPE Hunter Bot (Kraken Futures)
+- Uses local 'kraken_futures.py' for correct API authentication.
 - Logic: Sell $40/day until Day 60 OR BTC < 51k -> Then Buy phase.
 - Startup: Places order immediately if not done today, then repeats at 00:00 UTC.
 - Safety: Shutdown if BTC < 50.4k OR BTC > 67k.
-- Fix: JSON Formatting, Integer casting for Size, and cliOrdId generation.
 """
 
 import os
 import sys
 import time
 import logging
-import requests
 import json
-import hmac
-import hashlib
-import base64
-import urllib.parse
 import uuid
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Import the provided library
+try:
+    from kraken_futures import KrakenFuturesApi
+except ImportError:
+    print("ERROR: 'kraken_futures.py' not found in the same directory.")
+    sys.exit(1)
 
 # --- Configuration ---
 load_dotenv()
@@ -58,96 +61,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PepeBot")
 
-class KrakenFuturesMinimal:
-    """Minimal robust wrapper for Kraken Futures V3"""
-    def __init__(self, key, secret):
-        self.key = key
-        self.secret = secret
-        self.url = "https://futures.kraken.com"
-
-    def _sign(self, endpoint, post_data=""):
-        if endpoint.startswith("/derivatives"): endpoint = endpoint[12:]
-        postdata = post_data + endpoint
-        encoded = (postdata).encode('utf-8')
-        message = hashlib.sha256(encoded).digest()
-        signature = hmac.new(base64.b64decode(self.secret), message, hashlib.sha512)
-        return base64.b64encode(signature.digest()).decode()
-
-    def request(self, method, endpoint, params=None):
-        try:
-            full_url = self.url + endpoint
-            headers = {"APIKey": self.key}
-            
-            if method == "GET":
-                if params:
-                    q = urllib.parse.urlencode(params)
-                    full_url += f"?{q}"
-                    headers["Authent"] = self._sign(endpoint + "?" + q, "")
-                else:
-                    headers["Authent"] = self._sign(endpoint, "")
-                resp = requests.get(full_url, headers=headers, timeout=10)
-            else:
-                # Use compact separators to ensure JSON string matches signature input exactly
-                json_str = json.dumps(params, separators=(',', ':')) if params else ""
-                headers["Authent"] = self._sign(endpoint, json_str)
-                headers["Content-Type"] = "application/json"
-                resp = requests.post(full_url, headers=headers, data=json_str, timeout=10)
-
-            if resp.status_code >= 400:
-                logger.error(f"API Error {resp.status_code}: {resp.text}")
-                return {"error": resp.text}
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Request failed: {e}")
-            return {"error": str(e)}
-
-    def get_tickers(self):
-        return self.request("GET", "/derivatives/api/v3/tickers")
-
-    def get_equity(self):
-        res = self.request("GET", "/derivatives/api/v3/accounts")
-        try:
-            if "accounts" in res:
-                flex = res["accounts"].get("flex", {})
-                return float(flex.get("marginEquity", 0))
-            first_acc = list(res.get("accounts", {}).values())[0]
-            return float(first_acc.get("marginEquity", 0))
-        except: pass
-        return 0.0
-
-    def get_position(self, symbol):
-        res = self.request("GET", "/derivatives/api/v3/openpositions")
-        try:
-            for p in res.get("openPositions", []):
-                if p["symbol"].upper() == symbol.upper():
-                    return float(p["size"])
-        except: pass
-        return 0.0
-
-    def cancel_all(self, symbol):
-        return self.request("POST", "/derivatives/api/v3/cancelallorders", {"symbol": symbol})
-
-    def cancel_order(self, order_id):
-        return self.request("POST", "/derivatives/api/v3/cancelorder", {"order_id": order_id})
-
-    def send_order(self, payload):
-        # Ensure cliOrdId exists if not provided
-        if "cliOrdId" not in payload:
-            payload["cliOrdId"] = str(uuid.uuid4())[:18] # Short UUID
-        return self.request("POST", "/derivatives/api/v3/sendorder", payload)
-
 class PepeHunter:
     def __init__(self):
         if not API_KEY or not API_SEC:
-            logger.error("Missing API Keys")
+            logger.error("Missing API Keys in .env")
             sys.exit(1)
             
-        self.api = KrakenFuturesMinimal(API_KEY, API_SEC)
+        # Initialize the imported client
+        self.api = KrakenFuturesApi(API_KEY, API_SEC)
         
+        # Specs defaults
         self.tick_size = 0.000001
         self.qty_step = 1.0
         self.contract_val = 1.0
-        self.is_integer_qty = True # Flag for int vs float size
+        self.is_integer_qty = True 
         
         self.load_state()
         self.fetch_specs()
@@ -190,7 +117,12 @@ class PepeHunter:
                 self.state = default_state
         else:
             self.state = default_state
-            self.state["initial_equity"] = self.api.get_equity()
+            # Try to get initial equity
+            try:
+                acc = self.api.get_accounts()
+                if "accounts" in acc and "flex" in acc["accounts"]:
+                    self.state["initial_equity"] = float(acc["accounts"]["flex"].get("marginEquity", 0))
+            except Exception: pass
             self.save_state()
 
     def save_state(self):
@@ -201,49 +133,78 @@ class PepeHunter:
             logger.error(f"Save State Failed: {e}")
 
     def fetch_specs(self):
-        res = self.api.request("GET", "/derivatives/api/v3/instruments")
-        if "instruments" in res:
-            for inst in res["instruments"]:
-                if inst["symbol"].upper() == SYMBOL_PEPE:
-                    self.tick_size = float(inst.get("tickSize", 0.000001))
-                    self.contract_val = float(inst.get("contractValue", 1.0))
-                    
-                    precision = inst.get("contractValueTradePrecision", 0)
-                    self.qty_step = 10 ** (-int(precision))
-                    
-                    # If step is >= 1, we likely need to send Integers
-                    self.is_integer_qty = (self.qty_step >= 1.0)
+        try:
+            res = self.api.get_instruments()
+            if "instruments" in res:
+                for inst in res["instruments"]:
+                    if inst["symbol"].upper() == SYMBOL_PEPE:
+                        self.tick_size = float(inst.get("tickSize", 0.000001))
+                        self.contract_val = float(inst.get("contractValue", 1.0))
+                        
+                        precision = inst.get("contractValueTradePrecision", 0)
+                        self.qty_step = 10 ** (-int(precision))
+                        self.is_integer_qty = (self.qty_step >= 1.0)
 
-                    logger.info(f"SPECS | Tick: {self.tick_size} | Val: {self.contract_val} | "
-                                f"Prec: {precision} -> Step: {self.qty_step}")
-                    return
+                        logger.info(f"SPECS | Tick: {self.tick_size} | Val: {self.contract_val} | "
+                                    f"Prec: {precision} -> Step: {self.qty_step}")
+                        return
+        except Exception as e:
+            logger.error(f"Spec Fetch Error: {e}")
 
     def get_prices(self):
-        tickers = self.api.get_tickers()
-        if "tickers" in tickers:
-            for t in tickers["tickers"]:
-                if t["symbol"].upper() == SYMBOL_BTC:
-                    self.btc_price = float(t["markPrice"])
-                if t["symbol"].upper() == SYMBOL_PEPE:
-                    self.pepe_price = float(t["markPrice"])
+        try:
+            res = self.api.get_tickers()
+            if "tickers" in res:
+                for t in res["tickers"]:
+                    if t["symbol"].upper() == SYMBOL_BTC:
+                        self.btc_price = float(t["markPrice"])
+                    if t["symbol"].upper() == SYMBOL_PEPE:
+                        self.pepe_price = float(t["markPrice"])
+        except Exception as e:
+            logger.error(f"Get Prices Error: {e}")
+
+    def get_account_equity(self):
+        try:
+            res = self.api.get_accounts()
+            if "accounts" in res:
+                if "flex" in res["accounts"]:
+                    return float(res["accounts"]["flex"].get("marginEquity", 0))
+                # Fallback
+                first = list(res["accounts"].values())[0]
+                return float(first.get("marginEquity", 0))
+        except Exception: pass
+        return 0.0
+
+    def get_pos_size(self, symbol):
+        try:
+            res = self.api.get_open_positions()
+            for p in res.get("openPositions", []):
+                if p["symbol"].upper() == symbol.upper():
+                    return float(p["size"])
+        except Exception: pass
+        return 0.0
 
     def emergency_shutdown(self, reason):
         msg = f"EMERGENCY SHUTDOWN: {reason}. Closing positions."
         logger.critical(msg)
         self.ntfy(msg)
         
-        self.api.cancel_all(SYMBOL_PEPE)
-        time.sleep(2)
-        
-        pos_size = self.api.get_position(SYMBOL_PEPE)
-        if pos_size != 0:
-            side = "sell" if pos_size > 0 else "buy"
-            self.api.send_order({
-                "orderType": "mkt",
-                "symbol": SYMBOL_PEPE,
-                "side": side,
-                "size": int(abs(pos_size)) if self.is_integer_qty else abs(pos_size)
-            })
+        try:
+            self.api.cancel_all_orders({"symbol": SYMBOL_PEPE})
+            time.sleep(2)
+            
+            pos_size = self.get_pos_size(SYMBOL_PEPE)
+            if pos_size != 0:
+                side = "sell" if pos_size > 0 else "buy"
+                self.api.send_order({
+                    "orderType": "mkt",
+                    "symbol": SYMBOL_PEPE,
+                    "side": side,
+                    "size": int(abs(pos_size)) if self.is_integer_qty else abs(pos_size),
+                    "cliOrdId": str(uuid.uuid4())[:18]
+                })
+        except Exception as e:
+            logger.error(f"Shutdown Exec Error: {e}")
             
         sys.exit(0)
 
@@ -251,7 +212,6 @@ class PepeHunter:
         if price == 0 or self.contract_val == 0: return 0
         raw_qty = usd_amount / (price * self.contract_val)
         
-        # Rounding
         if self.qty_step == 0:
             final_qty = raw_qty
         else:
@@ -280,28 +240,35 @@ class PepeHunter:
             
             logger.info(f"EXEC: Placing Initial {target_side.upper()} {qty} @ {limit_px}")
             
-            resp = self.api.send_order({
-                "orderType": "lmt",
-                "symbol": SYMBOL_PEPE,
-                "side": target_side,
-                "size": qty,
-                "limitPrice": limit_px
-            })
-            
-            if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                self.active_order_id = resp["sendStatus"]["order_id"]
-                self.execution_start_ts = time.time()
-                self.execution_stage = "WAIT_INITIAL"
-            else:
-                logger.error(f"Exec Start Failed: {resp}")
-                self.execution_active = False 
+            try:
+                resp = self.api.send_order({
+                    "orderType": "lmt",
+                    "symbol": SYMBOL_PEPE,
+                    "side": target_side,
+                    "size": qty,
+                    "limitPrice": limit_px,
+                    "cliOrdId": str(uuid.uuid4())[:18]
+                })
+                
+                if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
+                    self.active_order_id = resp["sendStatus"]["order_id"]
+                    self.execution_start_ts = time.time()
+                    self.execution_stage = "WAIT_INITIAL"
+                else:
+                    logger.error(f"Exec Start Failed: {resp}")
+                    self.execution_active = False
+            except Exception as e:
+                logger.error(f"Exec API Exception: {e}")
+                self.execution_active = False
                 
         # 2. Wait Logic (3 Hours)
         elif self.execution_stage == "WAIT_INITIAL":
             elapsed = time.time() - self.execution_start_ts
             if elapsed > TIME_LIMIT_INITIAL:
                 logger.info("EXEC: 3 Hours passed. Switching to CHASE.")
-                self.api.cancel_order(self.active_order_id)
+                try:
+                    self.api.cancel_order({"order_id": self.active_order_id})
+                except: pass
                 self.execution_stage = "SETUP_CHASE"
 
         # 3. Setup Chase
@@ -310,21 +277,25 @@ class PepeHunter:
             offset = 1 + OFFSET_CHASE if target_side == "sell" else 1 - OFFSET_CHASE
             limit_px = self.round_price(self.pepe_price * offset)
             
-            resp = self.api.send_order({
-                "orderType": "lmt",
-                "symbol": SYMBOL_PEPE,
-                "side": target_side,
-                "size": qty,
-                "limitPrice": limit_px
-            })
-            if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                self.active_order_id = resp["sendStatus"]["order_id"]
-                self.chase_last_update = time.time()
-                self.chase_start_ts = time.time()
-                self.execution_stage = "CHASE"
-            else:
-                logger.warning("Chase Setup Failed. Dumping to Market.")
-                self.execution_stage = "MARKET_DUMP"
+            try:
+                resp = self.api.send_order({
+                    "orderType": "lmt",
+                    "symbol": SYMBOL_PEPE,
+                    "side": target_side,
+                    "size": qty,
+                    "limitPrice": limit_px,
+                    "cliOrdId": str(uuid.uuid4())[:18]
+                })
+                if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
+                    self.active_order_id = resp["sendStatus"]["order_id"]
+                    self.chase_last_update = time.time()
+                    self.chase_start_ts = time.time()
+                    self.execution_stage = "CHASE"
+                else:
+                    logger.warning(f"Chase Setup Failed: {resp}. Dumping to Market.")
+                    self.execution_stage = "MARKET_DUMP"
+            except:
+                 self.execution_stage = "MARKET_DUMP"
 
         # 4. Chase Loop (5 Mins)
         elif self.execution_stage == "CHASE":
@@ -333,41 +304,55 @@ class PepeHunter:
             
             if total_chase_time > TIME_LIMIT_CHASE:
                 logger.info("EXEC: Chase timeout. Dumping to MARKET.")
-                self.api.cancel_order(self.active_order_id)
+                try:
+                    self.api.cancel_order({"order_id": self.active_order_id})
+                except: pass
                 self.execution_stage = "MARKET_DUMP"
                 return
 
             if time_since_update > CHASE_UPDATE_FREQ:
-                self.api.cancel_order(self.active_order_id)
+                try:
+                    self.api.cancel_order({"order_id": self.active_order_id})
+                except: pass
+                
                 offset = 1 + OFFSET_CHASE if target_side == "sell" else 1 - OFFSET_CHASE
                 limit_px = self.round_price(self.pepe_price * offset)
                 qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
                 
-                resp = self.api.send_order({
-                    "orderType": "lmt",
-                    "symbol": SYMBOL_PEPE,
-                    "side": target_side,
-                    "size": qty,
-                    "limitPrice": limit_px
-                })
-                
-                if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                    self.active_order_id = resp["sendStatus"]["order_id"]
-                    self.chase_last_update = time.time()
-                    logger.info(f"EXEC: Chasing... {limit_px}")
-                else:
-                    self.execution_stage = "MARKET_DUMP"
+                try:
+                    resp = self.api.send_order({
+                        "orderType": "lmt",
+                        "symbol": SYMBOL_PEPE,
+                        "side": target_side,
+                        "size": qty,
+                        "limitPrice": limit_px,
+                        "cliOrdId": str(uuid.uuid4())[:18]
+                    })
+                    
+                    if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
+                        self.active_order_id = resp["sendStatus"]["order_id"]
+                        self.chase_last_update = time.time()
+                        logger.info(f"EXEC: Chasing... {limit_px}")
+                    else:
+                        self.execution_stage = "MARKET_DUMP"
+                except:
+                     self.execution_stage = "MARKET_DUMP"
 
         # 5. Market Dump
         elif self.execution_stage == "MARKET_DUMP":
             qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
-            self.api.send_order({
-                "orderType": "mkt",
-                "symbol": SYMBOL_PEPE,
-                "side": target_side,
-                "size": qty
-            })
-            logger.info("EXEC: Market Order Sent. Cycle Complete.")
+            try:
+                self.api.send_order({
+                    "orderType": "mkt",
+                    "symbol": SYMBOL_PEPE,
+                    "side": target_side,
+                    "size": qty,
+                    "cliOrdId": str(uuid.uuid4())[:18]
+                })
+                logger.info("EXEC: Market Order Sent. Cycle Complete.")
+            except Exception as e:
+                logger.error(f"Market Dump Failed: {e}")
+            
             self.execution_active = False
             self.execution_stage = "IDLE"
 
@@ -402,7 +387,7 @@ class PepeHunter:
                     self.state["phase"] = "buy"
                     self.save_state()
 
-                # 5. Execution Check
+                # 5. Execution Check (Startup OR New Day)
                 if self.state["last_trade_date"] != current_date and not self.execution_active:
                     
                     if self.btc_price > 0 and self.pepe_price > 0:
@@ -425,12 +410,12 @@ class PepeHunter:
                 if self.execution_active:
                     self.perform_execution_logic()
 
-                # 7. Notifications
+                # 7. Notifications (every 6 hours)
                 if utc_now.hour % 6 == 0 and utc_now.minute == 0:
                     if time.time() - self.last_notify_ts > 3600:
-                        cur_eq = self.api.get_equity()
+                        cur_eq = self.get_account_equity()
                         pnl = cur_eq - self.state["initial_equity"]
-                        pos = self.api.get_position(SYMBOL_PEPE)
+                        pos = self.get_pos_size(SYMBOL_PEPE)
                         msg = (f"REPORT | Day: {self.state['days_active']} | Phase: {self.state['phase']}\n"
                                f"PnL: ${pnl:.2f} | Pos: {pos} | BTC: {self.btc_price}")
                         self.ntfy(msg)
