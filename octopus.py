@@ -5,6 +5,7 @@ PEPE Hunter Bot (Kraken Futures)
 - Logic: Sell $40/day until Day 60 OR BTC < 51k -> Then Buy phase.
 - Startup: Places order immediately if not done today, then repeats at 00:00 UTC.
 - Safety: Shutdown if BTC < 50.4k OR BTC > 67k.
+- Fixes applied: Open order checking to prevent double-buys/sells and runaway loops.
 """
 
 import os
@@ -184,6 +185,23 @@ class PepeHunter:
         except Exception: pass
         return 0.0
 
+    def is_order_open(self, order_id):
+        """Checks if a specific order_id is currently open on the exchange."""
+        if not order_id:
+            return False
+        try:
+            res = self.api.get_open_orders()
+            if "openOrders" in res:
+                for order in res["openOrders"]:
+                    if order.get("order_id") == order_id:
+                        return True
+            # If we iterate through all open orders and don't find it, it has filled or cancelled.
+            return False 
+        except Exception as e:
+            logger.error(f"Error checking open orders: {e}")
+            # If the API fails, assume it's still open to prevent duplicate orders.
+            return True 
+
     def emergency_shutdown(self, reason):
         msg = f"EMERGENCY SHUTDOWN: {reason}. Closing positions."
         logger.critical(msg)
@@ -263,16 +281,32 @@ class PepeHunter:
                 
         # 2. Wait Logic (3 Hours)
         elif self.execution_stage == "WAIT_INITIAL":
+            # Safety Check: Did the initial order fill?
+            if not self.is_order_open(self.active_order_id):
+                logger.info("EXEC: Initial order was FILLED! Daily cycle complete.")
+                self.execution_active = False
+                self.execution_stage = "IDLE"
+                return
+
             elapsed = time.time() - self.execution_start_ts
             if elapsed > TIME_LIMIT_INITIAL:
                 logger.info("EXEC: 3 Hours passed. Switching to CHASE.")
                 try:
                     self.api.cancel_order({"order_id": self.active_order_id})
-                except: pass
+                except Exception as e: 
+                    logger.warning(f"Failed to cancel initial order (it may have just filled): {e}")
+                
                 self.execution_stage = "SETUP_CHASE"
 
         # 3. Setup Chase
         elif self.execution_stage == "SETUP_CHASE":
+            # Double check the initial order didn't fill in the split second before cancel
+            if self.active_order_id and not self.is_order_open(self.active_order_id):
+                logger.info("EXEC: Initial order filled at the last second. Cycle complete.")
+                self.execution_active = False
+                self.execution_stage = "IDLE"
+                return
+
             qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
             offset = 1 + OFFSET_CHASE if target_side == "sell" else 1 - OFFSET_CHASE
             limit_px = self.round_price(self.pepe_price * offset)
@@ -294,11 +328,19 @@ class PepeHunter:
                 else:
                     logger.warning(f"Chase Setup Failed: {resp}. Dumping to Market.")
                     self.execution_stage = "MARKET_DUMP"
-            except:
-                 self.execution_stage = "MARKET_DUMP"
+            except Exception as e:
+                logger.error(f"Chase Setup Error: {e}. Dumping to Market.")
+                self.execution_stage = "MARKET_DUMP"
 
         # 4. Chase Loop (5 Mins)
         elif self.execution_stage == "CHASE":
+            # Safety Check: Did the chase order fill?
+            if not self.is_order_open(self.active_order_id):
+                logger.info("EXEC: Chase order was FILLED! Daily cycle complete.")
+                self.execution_active = False
+                self.execution_stage = "IDLE"
+                return
+
             total_chase_time = time.time() - self.chase_start_ts
             time_since_update = time.time() - self.chase_last_update
             
@@ -306,14 +348,18 @@ class PepeHunter:
                 logger.info("EXEC: Chase timeout. Dumping to MARKET.")
                 try:
                     self.api.cancel_order({"order_id": self.active_order_id})
-                except: pass
+                except Exception as e: 
+                    logger.warning(f"Chase timeout cancel fail: {e}")
                 self.execution_stage = "MARKET_DUMP"
                 return
 
             if time_since_update > CHASE_UPDATE_FREQ:
+                # Cancel the active order. If this fails, we DO NOT place a new one.
                 try:
                     self.api.cancel_order({"order_id": self.active_order_id})
-                except: pass
+                except Exception as e: 
+                    logger.warning(f"Chase cancel failed (API error or filled): {e}. Skipping tick.")
+                    return # Skip this 5s tick, wait for next tick to avoid double orders.
                 
                 offset = 1 + OFFSET_CHASE if target_side == "sell" else 1 - OFFSET_CHASE
                 limit_px = self.round_price(self.pepe_price * offset)
@@ -332,11 +378,13 @@ class PepeHunter:
                     if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                         self.active_order_id = resp["sendStatus"]["order_id"]
                         self.chase_last_update = time.time()
-                        logger.info(f"EXEC: Chasing... {limit_px}")
+                        logger.info(f"EXEC: Chasing... updated to {limit_px}")
                     else:
+                        logger.error(f"Chase Update Error: {resp}")
                         self.execution_stage = "MARKET_DUMP"
-                except:
-                     self.execution_stage = "MARKET_DUMP"
+                except Exception as e:
+                    logger.error(f"Chase Update API Exception: {e}")
+                    self.execution_stage = "MARKET_DUMP"
 
         # 5. Market Dump
         elif self.execution_stage == "MARKET_DUMP":
