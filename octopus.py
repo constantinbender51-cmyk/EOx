@@ -4,7 +4,7 @@ PEPE Hunter Bot (Kraken Futures)
 - Logic: Sell $40/day until Day 60 OR BTC < 51k -> Then Buy phase.
 - Startup: Places order immediately if not done today, then repeats at 00:00 UTC.
 - Safety: Shutdown if BTC < 50.4k OR BTC > 67k.
-- Execution: Limit (1% offset, 3hr wait) -> Chase (0.01% offset, 5min duration) -> Market.
+- Fix: JSON Formatting, Integer casting for Size, and cliOrdId generation.
 """
 
 import os
@@ -17,6 +17,7 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -75,16 +76,19 @@ class KrakenFuturesMinimal:
     def request(self, method, endpoint, params=None):
         try:
             full_url = self.url + endpoint
-            headers = {"APIKey": self.key, "Authent": self._sign(endpoint, "")}
+            headers = {"APIKey": self.key}
             
             if method == "GET":
                 if params:
                     q = urllib.parse.urlencode(params)
                     full_url += f"?{q}"
                     headers["Authent"] = self._sign(endpoint + "?" + q, "")
+                else:
+                    headers["Authent"] = self._sign(endpoint, "")
                 resp = requests.get(full_url, headers=headers, timeout=10)
             else:
-                json_str = json.dumps(params) if params else ""
+                # Use compact separators to ensure JSON string matches signature input exactly
+                json_str = json.dumps(params, separators=(',', ':')) if params else ""
                 headers["Authent"] = self._sign(endpoint, json_str)
                 headers["Content-Type"] = "application/json"
                 resp = requests.post(full_url, headers=headers, data=json_str, timeout=10)
@@ -127,6 +131,9 @@ class KrakenFuturesMinimal:
         return self.request("POST", "/derivatives/api/v3/cancelorder", {"order_id": order_id})
 
     def send_order(self, payload):
+        # Ensure cliOrdId exists if not provided
+        if "cliOrdId" not in payload:
+            payload["cliOrdId"] = str(uuid.uuid4())[:18] # Short UUID
         return self.request("POST", "/derivatives/api/v3/sendorder", payload)
 
 class PepeHunter:
@@ -140,6 +147,7 @@ class PepeHunter:
         self.tick_size = 0.000001
         self.qty_step = 1.0
         self.contract_val = 1.0
+        self.is_integer_qty = True # Flag for int vs float size
         
         self.load_state()
         self.fetch_specs()
@@ -200,10 +208,12 @@ class PepeHunter:
                     self.tick_size = float(inst.get("tickSize", 0.000001))
                     self.contract_val = float(inst.get("contractValue", 1.0))
                     
-                    # Precision Handling (Negative means large integer steps)
                     precision = inst.get("contractValueTradePrecision", 0)
                     self.qty_step = 10 ** (-int(precision))
                     
+                    # If step is >= 1, we likely need to send Integers
+                    self.is_integer_qty = (self.qty_step >= 1.0)
+
                     logger.info(f"SPECS | Tick: {self.tick_size} | Val: {self.contract_val} | "
                                 f"Prec: {precision} -> Step: {self.qty_step}")
                     return
@@ -232,21 +242,23 @@ class PepeHunter:
                 "orderType": "mkt",
                 "symbol": SYMBOL_PEPE,
                 "side": side,
-                "size": abs(pos_size)
+                "size": int(abs(pos_size)) if self.is_integer_qty else abs(pos_size)
             })
             
         sys.exit(0)
 
-    def round_qty(self, raw_qty):
-        if self.qty_step == 0: return raw_qty
-        steps = round(raw_qty / self.qty_step)
-        rounded = steps * self.qty_step
-        return max(rounded, self.qty_step)
-
     def calculate_qty(self, usd_amount, price):
         if price == 0 or self.contract_val == 0: return 0
         raw_qty = usd_amount / (price * self.contract_val)
-        return self.round_qty(raw_qty)
+        
+        # Rounding
+        if self.qty_step == 0:
+            final_qty = raw_qty
+        else:
+            steps = round(raw_qty / self.qty_step)
+            final_qty = max(steps * self.qty_step, self.qty_step)
+            
+        return int(final_qty) if self.is_integer_qty else final_qty
 
     def round_price(self, price):
         steps = round(price / self.tick_size)
@@ -282,7 +294,7 @@ class PepeHunter:
                 self.execution_stage = "WAIT_INITIAL"
             else:
                 logger.error(f"Exec Start Failed: {resp}")
-                self.execution_active = False # Stop on API error to prevent loop spam
+                self.execution_active = False 
                 
         # 2. Wait Logic (3 Hours)
         elif self.execution_stage == "WAIT_INITIAL":
@@ -390,40 +402,36 @@ class PepeHunter:
                     self.state["phase"] = "buy"
                     self.save_state()
 
-                # 5. Execution Check (Startup OR New Day)
-                # If we haven't traded for the current UTC date, trigger immediately
+                # 5. Execution Check
                 if self.state["last_trade_date"] != current_date and not self.execution_active:
                     
-                    # Ensure we have valid prices before starting
                     if self.btc_price > 0 and self.pepe_price > 0:
                         
-                        # Phase Limits
                         if self.state["phase"] == "sell" and self.state["days_active"] >= MAX_PHASE_DAYS:
                             self.state["phase"] = "buy"
                             self.ntfy("Day 60 Reached. Switching Sell -> Buy.")
                             self.save_state()
                         
-                        logger.info(f"Triggering Daily Trade. Date: {current_date} (Last: {self.state['last_trade_date']})")
-                        
+                        logger.info(f"Triggering Daily Trade. Date: {current_date}")
                         self.execution_active = True
                         self.execution_stage = "START"
                         self.state["last_trade_date"] = current_date
                         self.state["days_active"] += 1
                         self.save_state()
                     else:
-                        logger.warning("Prices not yet available, waiting...")
+                        logger.warning("Waiting for price feed...")
 
                 # 6. Run Execution Logic
                 if self.execution_active:
                     self.perform_execution_logic()
 
-                # 7. Notifications (every 6 hours)
+                # 7. Notifications
                 if utc_now.hour % 6 == 0 and utc_now.minute == 0:
                     if time.time() - self.last_notify_ts > 3600:
                         cur_eq = self.api.get_equity()
                         pnl = cur_eq - self.state["initial_equity"]
                         pos = self.api.get_position(SYMBOL_PEPE)
-                        msg = (f"REPORT | Day: {self.state["days_active"]} | Phase: {self.state["phase"]}\n"
+                        msg = (f"REPORT | Day: {self.state['days_active']} | Phase: {self.state['phase']}\n"
                                f"PnL: ${pnl:.2f} | Pos: {pos} | BTC: {self.btc_price}")
                         self.ntfy(msg)
                         self.last_notify_ts = time.time()
