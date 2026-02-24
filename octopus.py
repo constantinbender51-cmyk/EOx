@@ -2,9 +2,9 @@
 """
 PEPE Hunter Bot (Kraken Futures)
 - Logic: Sell $40/day until Day 60 OR BTC < 51k -> Then Buy phase.
+- Startup: Places order immediately if not done today, then repeats at 00:00 UTC.
 - Safety: Shutdown if BTC < 50.4k OR BTC > 67k.
 - Execution: Limit (1% offset, 3hr wait) -> Chase (0.01% offset, 5min duration) -> Market.
-- Fix: Handles contractValueTradePrecision (negative/positive) for correct sizing.
 """
 
 import os
@@ -17,8 +17,7 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
-import math
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 
 # --- Configuration ---
@@ -107,7 +106,6 @@ class KrakenFuturesMinimal:
             if "accounts" in res:
                 flex = res["accounts"].get("flex", {})
                 return float(flex.get("marginEquity", 0))
-            # Fallback for non-flex
             first_acc = list(res.get("accounts", {}).values())[0]
             return float(first_acc.get("marginEquity", 0))
         except: pass
@@ -139,7 +137,6 @@ class PepeHunter:
             
         self.api = KrakenFuturesMinimal(API_KEY, API_SEC)
         
-        # Defaults, will be overwritten by fetch_specs
         self.tick_size = 0.000001
         self.qty_step = 1.0
         self.contract_val = 1.0
@@ -153,7 +150,7 @@ class PepeHunter:
         self.last_notify_ts = 0
         self.execution_active = False
         self.execution_start_ts = 0
-        self.execution_stage = "IDLE" # IDLE, WAIT_INITIAL, SETUP_CHASE, CHASE, MARKET_DUMP
+        self.execution_stage = "IDLE" 
         self.active_order_id = None
         self.chase_last_update = 0
         self.chase_start_ts = 0
@@ -171,8 +168,7 @@ class PepeHunter:
     def load_state(self):
         default_state = {
             "inception_ts": time.time(),
-            "phase": "sell", # 'sell' or 'buy'
-            "phase_start_day": 1,
+            "phase": "sell", 
             "days_active": 0,
             "last_trade_date": "",
             "initial_equity": 0.0,
@@ -197,12 +193,6 @@ class PepeHunter:
             logger.error(f"Save State Failed: {e}")
 
     def fetch_specs(self):
-        """
-        Fetches instrument specifications.
-        Handles contractValueTradePrecision which can be negative.
-        Negative precision = large steps (e.g. -2 -> 100).
-        Positive precision = decimal steps (e.g. 2 -> 0.01).
-        """
         res = self.api.request("GET", "/derivatives/api/v3/instruments")
         if "instruments" in res:
             for inst in res["instruments"]:
@@ -210,7 +200,7 @@ class PepeHunter:
                     self.tick_size = float(inst.get("tickSize", 0.000001))
                     self.contract_val = float(inst.get("contractValue", 1.0))
                     
-                    # Precision Handling
+                    # Precision Handling (Negative means large integer steps)
                     precision = inst.get("contractValueTradePrecision", 0)
                     self.qty_step = 10 ** (-int(precision))
                     
@@ -232,11 +222,9 @@ class PepeHunter:
         logger.critical(msg)
         self.ntfy(msg)
         
-        # Cancel all
         self.api.cancel_all(SYMBOL_PEPE)
         time.sleep(2)
         
-        # Market Close
         pos_size = self.api.get_position(SYMBOL_PEPE)
         if pos_size != 0:
             side = "sell" if pos_size > 0 else "buy"
@@ -250,14 +238,12 @@ class PepeHunter:
         sys.exit(0)
 
     def round_qty(self, raw_qty):
-        """Rounds quantity to the nearest multiple of self.qty_step"""
         if self.qty_step == 0: return raw_qty
         steps = round(raw_qty / self.qty_step)
         rounded = steps * self.qty_step
-        return max(rounded, self.qty_step) # Ensure at least 1 unit/step
+        return max(rounded, self.qty_step)
 
     def calculate_qty(self, usd_amount, price):
-        # Qty = USD / (Price * ContractValue)
         if price == 0 or self.contract_val == 0: return 0
         raw_qty = usd_amount / (price * self.contract_val)
         return self.round_qty(raw_qty)
@@ -267,21 +253,16 @@ class PepeHunter:
         return steps * self.tick_size
 
     def perform_execution_logic(self):
-        """Non-blocking execution logic"""
-        
-        # Target Side
         target_side = "sell" if self.state["phase"] == "sell" else "buy"
         
         # 1. Start Logic
         if self.execution_stage == "START":
             qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
             if qty <= 0: 
-                logger.warning("Calculated Qty is 0 (Price too high for $40?). Skipping.")
+                logger.warning("Calculated Qty is 0. Skipping.")
                 self.execution_active = False
                 return
 
-            # Price: 1% offset
-            # Sell: Price * 1.01 | Buy: Price * 0.99
             offset = 1 + OFFSET_INITIAL if target_side == "sell" else 1 - OFFSET_INITIAL
             limit_px = self.round_price(self.pepe_price * offset)
             
@@ -301,30 +282,19 @@ class PepeHunter:
                 self.execution_stage = "WAIT_INITIAL"
             else:
                 logger.error(f"Exec Start Failed: {resp}")
-                # Retry logic for next tick
+                self.execution_active = False # Stop on API error to prevent loop spam
                 
         # 2. Wait Logic (3 Hours)
         elif self.execution_stage == "WAIT_INITIAL":
             elapsed = time.time() - self.execution_start_ts
-            
-            # Check if order is still open
-            # We assume open unless we get a 'filled' message via socket (not impl) or query
-            # For simplicity: query open orders every minute to see if it vanished (filled)
-            if int(elapsed) % 60 == 0:
-                # Optional: Check if order exists. If not, we are done.
-                pass 
-
             if elapsed > TIME_LIMIT_INITIAL:
                 logger.info("EXEC: 3 Hours passed. Switching to CHASE.")
                 self.api.cancel_order(self.active_order_id)
                 self.execution_stage = "SETUP_CHASE"
-                self.chase_start_ts = time.time()
 
         # 3. Setup Chase
         elif self.execution_stage == "SETUP_CHASE":
             qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
-            
-            # Tight offset: 0.01%
             offset = 1 + OFFSET_CHASE if target_side == "sell" else 1 - OFFSET_CHASE
             limit_px = self.round_price(self.pepe_price * offset)
             
@@ -338,6 +308,7 @@ class PepeHunter:
             if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                 self.active_order_id = resp["sendStatus"]["order_id"]
                 self.chase_last_update = time.time()
+                self.chase_start_ts = time.time()
                 self.execution_stage = "CHASE"
             else:
                 logger.warning("Chase Setup Failed. Dumping to Market.")
@@ -355,10 +326,7 @@ class PepeHunter:
                 return
 
             if time_since_update > CHASE_UPDATE_FREQ:
-                # Update price
                 self.api.cancel_order(self.active_order_id)
-                
-                # Re-calc price
                 offset = 1 + OFFSET_CHASE if target_side == "sell" else 1 - OFFSET_CHASE
                 limit_px = self.round_price(self.pepe_price * offset)
                 qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
@@ -394,14 +362,14 @@ class PepeHunter:
     def run(self):
         logger.info("--- PEPE Hunter Started ---")
         self.ntfy(f"Bot Started. Phase: {self.state['phase']}")
-        self.fetch_specs() # Refresh specs on start
+        self.fetch_specs()
 
         while True:
             try:
                 # 1. Update Prices
                 self.get_prices()
-                now_ts = time.time()
-                current_date = datetime.utcnow().strftime("%Y-%m-%d")
+                utc_now = datetime.utcnow()
+                current_date = utc_now.strftime("%Y-%m-%d")
 
                 # 2. Safety Checks
                 if self.btc_price < BTC_LO_SHUTDOWN and self.btc_price > 0:
@@ -416,49 +384,46 @@ class PepeHunter:
                     self.state["notified_51400"] = True
                     self.save_state()
 
-                # 4. Phase Switching Logic
-                # If Selling and BTC < 51k -> Switch to Buying
+                # 4. Phase Switching
                 if self.state["phase"] == "sell" and self.btc_price < BTC_PHASE_SWITCH and self.btc_price > 0:
                     self.ntfy(f"PHASE SWITCH: Selling -> Buying (BTC {self.btc_price})")
                     self.state["phase"] = "buy"
-                    # Reset counter for new phase if logic dictates, or keep counting total days
                     self.save_state()
 
-                # 5. Daily Execution Check
-                # Run at 00:00 UTC (tolerance 5 mins) if not done today
-                utc_now = datetime.utcnow()
-                is_start_of_day = (utc_now.hour == 0 and utc_now.minute < 30)
-                
-                if is_start_of_day and self.state["last_trade_date"] != current_date and not self.execution_active:
+                # 5. Execution Check (Startup OR New Day)
+                # If we haven't traded for the current UTC date, trigger immediately
+                if self.state["last_trade_date"] != current_date and not self.execution_active:
                     
-                    # Logic: If Phase is SELL and Day >= 60 -> Switch to BUY
-                    if self.state["phase"] == "sell" and self.state["days_active"] >= MAX_PHASE_DAYS:
-                        self.state["phase"] = "buy"
-                        self.ntfy("Day 60 Reached. Switching Sell -> Buy.")
+                    # Ensure we have valid prices before starting
+                    if self.btc_price > 0 and self.pepe_price > 0:
+                        
+                        # Phase Limits
+                        if self.state["phase"] == "sell" and self.state["days_active"] >= MAX_PHASE_DAYS:
+                            self.state["phase"] = "buy"
+                            self.ntfy("Day 60 Reached. Switching Sell -> Buy.")
+                            self.save_state()
+                        
+                        logger.info(f"Triggering Daily Trade. Date: {current_date} (Last: {self.state['last_trade_date']})")
+                        
+                        self.execution_active = True
+                        self.execution_stage = "START"
+                        self.state["last_trade_date"] = current_date
+                        self.state["days_active"] += 1
                         self.save_state()
-                    
-                    if self.state["days_active"] == MAX_PHASE_DAYS:
-                        self.ntfy("Day 60 Breach Alert.")
+                    else:
+                        logger.warning("Prices not yet available, waiting...")
 
-                    logger.info(f"Starting Daily Trade. Day: {self.state['days_active']}. Phase: {self.state['phase']}")
-                    
-                    self.execution_active = True
-                    self.execution_stage = "START"
-                    self.state["last_trade_date"] = current_date
-                    self.state["days_active"] += 1
-                    self.save_state()
-
-                # 6. Run Execution Logic if Active
+                # 6. Run Execution Logic
                 if self.execution_active:
                     self.perform_execution_logic()
 
-                # 7. Periodic Notifications (6 Hours)
+                # 7. Notifications (every 6 hours)
                 if utc_now.hour % 6 == 0 and utc_now.minute == 0:
                     if time.time() - self.last_notify_ts > 3600:
                         cur_eq = self.api.get_equity()
                         pnl = cur_eq - self.state["initial_equity"]
                         pos = self.api.get_position(SYMBOL_PEPE)
-                        msg = (f"REPORT | Day: {self.state['days_active']} | Phase: {self.state['phase']}\n"
+                        msg = (f"REPORT | Day: {self.state["days_active"]} | Phase: {self.state["phase"]}\n"
                                f"PnL: ${pnl:.2f} | Pos: {pos} | BTC: {self.btc_price}")
                         self.ntfy(msg)
                         self.last_notify_ts = time.time()
