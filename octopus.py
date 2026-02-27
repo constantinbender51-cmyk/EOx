@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-PEPE Hunter Bot (Kraken Futures)
-- Uses local 'kraken_futures.py' for correct API authentication.
-- Logic: Sell $40/day until Day 60 OR BTC < 51k -> Then Buy phase.
-- Startup: Places order immediately if not done today, then repeats at 00:00 UTC.
-- Safety: Shutdown if BTC < 50.4k OR BTC > 67k.
-- Fixes applied: Open order checking to prevent double-buys/sells and runaway loops.
+Hourly Strategy Executor for try3btc.up.railway.app
+- Scrapes the web app for targets.
+- Allocates 1/16th of Capital * Leverage per asset.
+- Executes position deltas using 5-min Limit Chase -> Market.
+- Monitors price every minute to locally trigger and trail stop losses.
 """
 
 import os
 import sys
 import time
 import logging
+import re
 import json
-import uuid
+import math
+import threading
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Import the provided library
 try:
     from kraken_futures import KrakenFuturesApi
 except ImportError:
@@ -27,32 +28,16 @@ except ImportError:
 
 # --- Configuration ---
 load_dotenv()
+API_KEY = os.getenv("KRAKEN_FUTURES_KEY")
+API_SEC = os.getenv("KRAKEN_FUTURES_SECRET")
 
-API_KEY = os.getenv("KEY")
-API_SEC = os.getenv("SECRET")
-NTFY_TOPIC = os.getenv("NTFY_TOPIC")
+WEB_APP_URL = "https://try3btc.up.railway.app"
+LEVERAGE = 3.0
+MAX_CHASE_MINUTES = 5
+CHASE_TICK_SECONDS = 5
 
-# Symbols
-SYMBOL_PEPE = "PF_PEPEUSD" 
-SYMBOL_BTC = "PF_XBTUSD"
-
-# Logic Settings
-DAILY_SIZE_USD = 40.0
-BTC_LO_SHUTDOWN = 50400.0
-BTC_HI_SHUTDOWN = 67000.0
-BTC_PHASE_SWITCH = 51000.0
-BTC_NOTIFY_LEVEL = 51400.0
-MAX_PHASE_DAYS = 60
-
-# Execution Settings
-OFFSET_INITIAL = 0.01    # 1%
-OFFSET_CHASE = 0.0001    # 0.01%
-TIME_LIMIT_INITIAL = 3 * 60 * 60 # 3 hours
-TIME_LIMIT_CHASE = 5 * 60        # 5 minutes
-CHASE_UPDATE_FREQ = 5            # 5 seconds
-
-STATE_FILE = "pepe_state.json"
-LOG_FILE = "pepe_hunter.log"
+STATE_FILE = "executor_state.json"
+LOG_FILE = "executor.log"
 
 # Setup Logging
 logging.basicConfig(
@@ -60,71 +45,51 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("PepeBot")
+logger = logging.getLogger("AppExecutor")
 
-class PepeHunter:
+# Binance Spot -> Kraken Futures Mapping
+SYMBOL_MAP = {
+    'BTC': 'PF_XBTUSD',
+    'ETH': 'PF_ETHUSD',
+    'XRP': 'PF_XRPUSD',
+    'SOL': 'PF_SOLUSD',
+    'DOGE': 'PF_DOGEUSD',
+    'ADA': 'PF_ADAUSD',
+    'BCH': 'PF_BCHUSD',
+    'LINK': 'PF_LINKUSD',
+    'XLM': 'PF_XLMUSD',
+    'SUI': 'PF_SUIUSD',
+    'AVAX': 'PF_AVAXUSD',
+    'LTC': 'PF_LTCUSD',
+    'HBAR': 'PF_HBARUSD', 
+    'SHIB': 'PF_SHIBUSD', # Typically 1000SHIB, bot will auto-adjust if contract specs exist
+    'TON': 'PF_TONUSD',
+    'PEPE': 'PF_PEPEUSD'
+}
+
+class AppExecutor:
     def __init__(self):
         if not API_KEY or not API_SEC:
-            logger.error("Missing API Keys in .env")
+            logger.error("Missing Kraken API Keys in .env")
             sys.exit(1)
             
-        # Initialize the imported client
         self.api = KrakenFuturesApi(API_KEY, API_SEC)
-        
-        # Specs defaults
-        self.tick_size = 0.000001
-        self.qty_step = 1.0
-        self.contract_val = 1.0
-        self.is_integer_qty = True 
+        self.specs = {}
+        self.state = {}
         
         self.load_state()
         self.fetch_specs()
         
-        # Runtime variables
-        self.btc_price = 0.0
-        self.pepe_price = 0.0
-        self.last_notify_ts = 0
-        self.execution_active = False
-        self.execution_start_ts = 0
-        self.execution_stage = "IDLE" 
-        self.active_order_id = None
-        self.chase_last_update = 0
-        self.chase_start_ts = 0
-
-    def ntfy(self, message):
-        logger.info(f"NOTIFY: {message}")
-        if NTFY_TOPIC:
-            try:
-                requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", 
-                              data=message.encode('utf-8'),
-                              headers={"Title": "PEPE Bot Update"})
-            except Exception as e:
-                logger.error(f"Ntfy failed: {e}")
-
     def load_state(self):
-        default_state = {
-            "inception_ts": time.time(),
-            "phase": "sell", 
-            "days_active": 0,
-            "last_trade_date": "",
-            "initial_equity": 0.0,
-            "notified_51400": False
-        }
         if os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, "r") as f:
                     self.state = json.load(f)
-            except:
-                self.state = default_state
+            except Exception as e:
+                logger.error(f"Failed to load state: {e}")
+                self.state = {}
         else:
-            self.state = default_state
-            # Try to get initial equity
-            try:
-                acc = self.api.get_accounts()
-                if "accounts" in acc and "flex" in acc["accounts"]:
-                    self.state["initial_equity"] = float(acc["accounts"]["flex"].get("marginEquity", 0))
-            except Exception: pass
-            self.save_state()
+            self.state = {}
 
     def save_state(self):
         try:
@@ -134,350 +99,359 @@ class PepeHunter:
             logger.error(f"Save State Failed: {e}")
 
     def fetch_specs(self):
+        logger.info("Fetching Instrument Specs...")
         try:
             res = self.api.get_instruments()
             if "instruments" in res:
                 for inst in res["instruments"]:
-                    if inst["symbol"].upper() == SYMBOL_PEPE:
-                        self.tick_size = float(inst.get("tickSize", 0.000001))
-                        self.contract_val = float(inst.get("contractValue", 1.0))
-                        
-                        precision = inst.get("contractValueTradePrecision", 0)
-                        self.qty_step = 10 ** (-int(precision))
-                        self.is_integer_qty = (self.qty_step >= 1.0)
-
-                        logger.info(f"SPECS | Tick: {self.tick_size} | Val: {self.contract_val} | "
-                                    f"Prec: {precision} -> Step: {self.qty_step}")
-                        return
+                    sym = inst["symbol"].upper()
+                    self.specs[sym] = {
+                        "tickSize": float(inst.get("tickSize", 0.000001)),
+                        "contractValue": float(inst.get("contractValue", 1.0)),
+                        "precision": int(inst.get("contractValueTradePrecision", 0)),
+                        "qty_step": 10 ** (-int(inst.get("contractValueTradePrecision", 0)))
+                    }
         except Exception as e:
             logger.error(f"Spec Fetch Error: {e}")
-
-    def get_prices(self):
-        try:
-            res = self.api.get_tickers()
-            if "tickers" in res:
-                for t in res["tickers"]:
-                    if t["symbol"].upper() == SYMBOL_BTC:
-                        self.btc_price = float(t["markPrice"])
-                    if t["symbol"].upper() == SYMBOL_PEPE:
-                        self.pepe_price = float(t["markPrice"])
-        except Exception as e:
-            logger.error(f"Get Prices Error: {e}")
 
     def get_account_equity(self):
         try:
             res = self.api.get_accounts()
-            if "accounts" in res:
-                if "flex" in res["accounts"]:
-                    return float(res["accounts"]["flex"].get("marginEquity", 0))
-                # Fallback
-                first = list(res["accounts"].values())[0]
-                return float(first.get("marginEquity", 0))
-        except Exception: pass
+            if "accounts" in res and "flex" in res["accounts"]:
+                return float(res["accounts"]["flex"].get("marginEquity", 0))
+        except Exception as e:
+            logger.error(f"Equity Fetch Error: {e}")
         return 0.0
 
-    def get_pos_size(self, symbol):
+    def get_current_prices(self):
+        prices = {}
+        try:
+            res = self.api.get_tickers()
+            if "tickers" in res:
+                for t in res["tickers"]:
+                    prices[t["symbol"].upper()] = float(t["markPrice"])
+        except Exception as e:
+            logger.error(f"Get Prices Error: {e}")
+        return prices
+
+    def get_open_positions(self):
+        positions = {}
         try:
             res = self.api.get_open_positions()
             for p in res.get("openPositions", []):
-                if p["symbol"].upper() == symbol.upper():
-                    return float(p["size"])
-        except Exception: pass
-        return 0.0
-
-    def is_order_open(self, order_id):
-        """Checks if a specific order_id is currently open on the exchange."""
-        if not order_id:
-            return False
-        try:
-            res = self.api.get_open_orders()
-            if "openOrders" in res:
-                for order in res["openOrders"]:
-                    if order.get("order_id") == order_id:
-                        return True
-            # If we iterate through all open orders and don't find it, it has filled or cancelled.
-            return False 
+                positions[p["symbol"].upper()] = float(p["size"])
         except Exception as e:
-            logger.error(f"Error checking open orders: {e}")
-            # If the API fails, assume it's still open to prevent duplicate orders.
-            return True 
+            logger.error(f"Get Positions Error: {e}")
+        return positions
 
-    def emergency_shutdown(self, reason):
-        msg = f"EMERGENCY SHUTDOWN: {reason}. Closing positions."
-        logger.critical(msg)
-        self.ntfy(msg)
-        
+    def cancel_symbol_orders(self, symbol):
         try:
-            self.api.cancel_all_orders({"symbol": SYMBOL_PEPE})
-            time.sleep(2)
-            
-            pos_size = self.get_pos_size(SYMBOL_PEPE)
-            if pos_size != 0:
-                side = "sell" if pos_size > 0 else "buy"
-                self.api.send_order({
-                    "orderType": "mkt",
-                    "symbol": SYMBOL_PEPE,
-                    "side": side,
-                    "size": int(abs(pos_size)) if self.is_integer_qty else abs(pos_size),
-                    "cliOrdId": str(uuid.uuid4())[:18]
-                })
+            self.api.cancel_all_orders({"symbol": symbol})
         except Exception as e:
-            logger.error(f"Shutdown Exec Error: {e}")
+            logger.error(f"Cancel Orders Error for {symbol}: {e}")
+
+    def scrape_web_app(self):
+        logger.info(f"Scraping targets from {WEB_APP_URL}...")
+        targets = {}
+        try:
+            resp = requests.get(WEB_APP_URL, timeout=15)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            rows = soup.find_all('tr')
             
-        sys.exit(0)
-
-    def calculate_qty(self, usd_amount, price):
-        if price == 0 or self.contract_val == 0: return 0
-        raw_qty = usd_amount / (price * self.contract_val)
-        
-        if self.qty_step == 0:
-            final_qty = raw_qty
-        else:
-            steps = round(raw_qty / self.qty_step)
-            final_qty = max(steps * self.qty_step, self.qty_step)
-            
-        return int(final_qty) if self.is_integer_qty else final_qty
-
-    def round_price(self, price):
-        steps = round(price / self.tick_size)
-        return steps * self.tick_size
-
-    def perform_execution_logic(self):
-        target_side = "sell" if self.state["phase"] == "sell" else "buy"
-        
-        # 1. Start Logic
-        if self.execution_stage == "START":
-            qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
-            if qty <= 0: 
-                logger.warning("Calculated Qty is 0. Skipping.")
-                self.execution_active = False
-                return
-
-            offset = 1 + OFFSET_INITIAL if target_side == "sell" else 1 - OFFSET_INITIAL
-            limit_px = self.round_price(self.pepe_price * offset)
-            
-            logger.info(f"EXEC: Placing Initial {target_side.upper()} {qty} @ {limit_px}")
-            
-            try:
-                resp = self.api.send_order({
-                    "orderType": "lmt",
-                    "symbol": SYMBOL_PEPE,
-                    "side": target_side,
-                    "size": qty,
-                    "limitPrice": limit_px,
-                    "cliOrdId": str(uuid.uuid4())[:18]
-                })
-                
-                if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                    self.active_order_id = resp["sendStatus"]["order_id"]
-                    self.execution_start_ts = time.time()
-                    self.execution_stage = "WAIT_INITIAL"
-                else:
-                    logger.error(f"Exec Start Failed: {resp}")
-                    self.execution_active = False
-            except Exception as e:
-                logger.error(f"Exec API Exception: {e}")
-                self.execution_active = False
-                
-        # 2. Wait Logic (3 Hours)
-        elif self.execution_stage == "WAIT_INITIAL":
-            # Safety Check: Did the initial order fill?
-            if not self.is_order_open(self.active_order_id):
-                logger.info("EXEC: Initial order was FILLED! Daily cycle complete.")
-                self.execution_active = False
-                self.execution_stage = "IDLE"
-                return
-
-            elapsed = time.time() - self.execution_start_ts
-            if elapsed > TIME_LIMIT_INITIAL:
-                logger.info("EXEC: 3 Hours passed. Switching to CHASE.")
-                try:
-                    self.api.cancel_order({"order_id": self.active_order_id})
-                except Exception as e: 
-                    logger.warning(f"Failed to cancel initial order (it may have just filled): {e}")
-                
-                self.execution_stage = "SETUP_CHASE"
-
-        # 3. Setup Chase
-        elif self.execution_stage == "SETUP_CHASE":
-            # Double check the initial order didn't fill in the split second before cancel
-            if self.active_order_id and not self.is_order_open(self.active_order_id):
-                logger.info("EXEC: Initial order filled at the last second. Cycle complete.")
-                self.execution_active = False
-                self.execution_stage = "IDLE"
-                return
-
-            qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
-            offset = 1 + OFFSET_CHASE if target_side == "sell" else 1 - OFFSET_CHASE
-            limit_px = self.round_price(self.pepe_price * offset)
-            
-            try:
-                resp = self.api.send_order({
-                    "orderType": "lmt",
-                    "symbol": SYMBOL_PEPE,
-                    "side": target_side,
-                    "size": qty,
-                    "limitPrice": limit_px,
-                    "cliOrdId": str(uuid.uuid4())[:18]
-                })
-                if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                    self.active_order_id = resp["sendStatus"]["order_id"]
-                    self.chase_last_update = time.time()
-                    self.chase_start_ts = time.time()
-                    self.execution_stage = "CHASE"
-                else:
-                    logger.warning(f"Chase Setup Failed: {resp}. Dumping to Market.")
-                    self.execution_stage = "MARKET_DUMP"
-            except Exception as e:
-                logger.error(f"Chase Setup Error: {e}. Dumping to Market.")
-                self.execution_stage = "MARKET_DUMP"
-
-        # 4. Chase Loop (5 Mins)
-        elif self.execution_stage == "CHASE":
-            # Safety Check: Did the chase order fill?
-            if not self.is_order_open(self.active_order_id):
-                logger.info("EXEC: Chase order was FILLED! Daily cycle complete.")
-                self.execution_active = False
-                self.execution_stage = "IDLE"
-                return
-
-            total_chase_time = time.time() - self.chase_start_ts
-            time_since_update = time.time() - self.chase_last_update
-            
-            if total_chase_time > TIME_LIMIT_CHASE:
-                logger.info("EXEC: Chase timeout. Dumping to MARKET.")
-                try:
-                    self.api.cancel_order({"order_id": self.active_order_id})
-                except Exception as e: 
-                    logger.warning(f"Chase timeout cancel fail: {e}")
-                self.execution_stage = "MARKET_DUMP"
-                return
-
-            if time_since_update > CHASE_UPDATE_FREQ:
-                # Cancel the active order. If this fails, we DO NOT place a new one.
-                try:
-                    self.api.cancel_order({"order_id": self.active_order_id})
-                except Exception as e: 
-                    logger.warning(f"Chase cancel failed (API error or filled): {e}. Skipping tick.")
-                    return # Skip this 5s tick, wait for next tick to avoid double orders.
-                
-                offset = 1 + OFFSET_CHASE if target_side == "sell" else 1 - OFFSET_CHASE
-                limit_px = self.round_price(self.pepe_price * offset)
-                qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
-                
-                try:
-                    resp = self.api.send_order({
-                        "orderType": "lmt",
-                        "symbol": SYMBOL_PEPE,
-                        "side": target_side,
-                        "size": qty,
-                        "limitPrice": limit_px,
-                        "cliOrdId": str(uuid.uuid4())[:18]
-                    })
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) >= 7 and cols[0].text.strip() in SYMBOL_MAP:
+                    base_sym = cols[0].text.strip()
+                    k_sym = SYMBOL_MAP[base_sym]
+                    status = cols[1].text.strip().upper()
                     
-                    if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                        self.active_order_id = resp["sendStatus"]["order_id"]
-                        self.chase_last_update = time.time()
-                        logger.info(f"EXEC: Chasing... updated to {limit_px}")
-                    else:
-                        logger.error(f"Chase Update Error: {resp}")
-                        self.execution_stage = "MARKET_DUMP"
-                except Exception as e:
-                    logger.error(f"Chase Update API Exception: {e}")
-                    self.execution_stage = "MARKET_DUMP"
+                    try:
+                        ep_text = cols[3].text.replace('$', '').replace(',', '').strip()
+                        ep = float(ep_text) if ep_text != '-' else 0.0
+                    except: ep = 0.0
+                    
+                    params_text = cols[6].text
+                    c_match = re.search(r'c:([\d.]+)%', params_text)
+                    sl_match = re.search(r'sl:([\d.]+)%', params_text)
+                    
+                    tsl_pct = float(c_match.group(1))/100.0 if c_match else 0.02
+                    sl_pct = float(sl_match.group(1))/100.0 if sl_match else 0.02
+                    
+                    target_dir = 0
+                    if "ACTIVE LONG" in status: target_dir = 1
+                    elif "ACTIVE SHORT" in status: target_dir = -1
+                    
+                    targets[k_sym] = {
+                        "direction": target_dir,
+                        "ep": ep,
+                        "tsl_pct": tsl_pct,
+                        "sl_pct": sl_pct
+                    }
+        except Exception as e:
+            logger.error(f"Scraper Error: {e}")
+            
+        return targets
 
-        # 5. Market Dump
-        elif self.execution_stage == "MARKET_DUMP":
-            qty = self.calculate_qty(DAILY_SIZE_USD, self.pepe_price)
+    def calculate_qty(self, symbol, target_usd, price):
+        if symbol not in self.specs or price == 0: return 0.0
+        c_val = self.specs[symbol]["contractValue"]
+        q_step = max(self.specs[symbol]["qty_step"], 1.0)
+        
+        raw_qty = target_usd / (price * c_val)
+        final_qty = max(round(raw_qty / q_step) * q_step, q_step)
+        
+        if self.specs[symbol]["qty_step"] >= 1.0:
+            return int(final_qty)
+        return final_qty
+
+    def round_price(self, symbol, price):
+        if symbol not in self.specs: return price
+        ts = self.specs[symbol]["tickSize"]
+        return round(price / ts) * ts
+
+    def execute_chase(self, symbol, target_size):
+        """Places a Limit order, adjusts it for 5 mins to catch Mark Price, then Markets."""
+        start_time = time.time()
+        logger.info(f"[{symbol}] Starting Chase execution to target size: {target_size}")
+        
+        while time.time() - start_time < (MAX_CHASE_MINUTES * 60):
+            current_pos = self.get_open_positions().get(symbol, 0.0)
+            delta = target_size - current_pos
+            
+            # If we are within 1 qty_step of target, consider it filled
+            q_step = self.specs.get(symbol, {}).get("qty_step", 1.0)
+            if abs(delta) < q_step:
+                logger.info(f"[{symbol}] Chase filled target. Current Pos: {current_pos}")
+                return current_pos
+                
+            side = "buy" if delta > 0 else "sell"
+            size = abs(delta)
+            
+            # Get latest price to peg limit order
+            prices = self.get_current_prices()
+            px = prices.get(symbol)
+            if not px:
+                time.sleep(5)
+                continue
+                
+            limit_px = self.round_price(symbol, px)
+            
+            self.cancel_symbol_orders(symbol) # Clear existing chase limits
+            
+            try:
+                self.api.send_order({
+                    "orderType": "lmt",
+                    "symbol": symbol,
+                    "side": side,
+                    "size": size,
+                    "limitPrice": limit_px
+                })
+            except Exception as e:
+                logger.error(f"[{symbol}] Chase Lmt Error: {e}")
+                
+            time.sleep(CHASE_TICK_SECONDS)
+            
+        # 5 mins passed, dump remaining to market
+        current_pos = self.get_open_positions().get(symbol, 0.0)
+        delta = target_size - current_pos
+        if abs(delta) >= self.specs.get(symbol, {}).get("qty_step", 1.0):
+            side = "buy" if delta > 0 else "sell"
+            logger.warning(f"[{symbol}] Chase Timeout! Sending MARKET for {abs(delta)} ({side})")
+            self.cancel_symbol_orders(symbol)
             try:
                 self.api.send_order({
                     "orderType": "mkt",
-                    "symbol": SYMBOL_PEPE,
-                    "side": target_side,
-                    "size": qty,
-                    "cliOrdId": str(uuid.uuid4())[:18]
+                    "symbol": symbol,
+                    "side": side,
+                    "size": abs(delta)
                 })
-                logger.info("EXEC: Market Order Sent. Cycle Complete.")
             except Exception as e:
-                logger.error(f"Market Dump Failed: {e}")
+                logger.error(f"[{symbol}] Market Dump Error: {e}")
+                
+        return self.get_open_positions().get(symbol, 0.0)
+
+    def place_stop_loss(self, symbol, position, target_data):
+        """Places the initial Stop Market order."""
+        if position == 0: return
+        
+        ep = target_data["ep"]
+        sl_pct = target_data["sl_pct"]
+        side = "sell" if position > 0 else "buy"
+        
+        raw_sl = ep * (1 - sl_pct) if position > 0 else ep * (1 + sl_pct)
+        stop_px = self.round_price(symbol, raw_sl)
+        
+        try:
+            resp = self.api.send_order({
+                "orderType": "stp",
+                "symbol": symbol,
+                "side": side,
+                "size": abs(position),
+                "stopPrice": stop_px
+            })
+            if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
+                order_id = resp["sendStatus"]["order_id"]
+                
+                # Setup local tracking state
+                self.state[symbol] = {
+                    "pos": position,
+                    "ep": ep,
+                    "highest": ep,
+                    "lowest": ep,
+                    "act_price": ep * (1 + target_data["tsl_pct"]) if position > 0 else ep * (1 - target_data["tsl_pct"]),
+                    "tsl_pct": target_data["tsl_pct"],
+                    "current_sl_price": stop_px,
+                    "sl_order_id": order_id
+                }
+                self.save_state()
+                logger.info(f"[{symbol}] Initial SL placed at {stop_px}. ID: {order_id}")
+        except Exception as e:
+            logger.error(f"[{symbol}] SL Placement Error: {e}")
+
+    def hourly_sync(self):
+        """Scrapes app, calculates deltas, executes orders."""
+        logger.info("=== STARTING HOURLY SYNC ===")
+        targets = self.scrape_web_app()
+        if not targets:
+            logger.warning("No targets scraped. Aborting sync.")
+            return
+
+        equity = self.get_account_equity()
+        if equity <= 0:
+            logger.error("Equity is 0 or failed to fetch. Aborting.")
+            return
             
-            self.execution_active = False
-            self.execution_stage = "IDLE"
+        usd_per_asset = (equity / 16.0) * LEVERAGE
+        logger.info(f"Equity: ${equity:.2f} | Allocation per asset: ${usd_per_asset:.2f} (Lev: {LEVERAGE}x)")
+        
+        prices = self.get_current_prices()
+        current_positions = self.get_open_positions()
+        
+        threads = []
+        
+        for symbol, t_data in targets.items():
+            if symbol not in self.specs: continue
+            
+            px = prices.get(symbol)
+            if not px: continue
+            
+            target_qty = self.calculate_qty(symbol, usd_per_asset, px) * t_data["direction"]
+            current_qty = current_positions.get(symbol, 0.0)
+            
+            q_step = self.specs[symbol]["qty_step"]
+            delta = target_qty - current_qty
+            
+            # If position changed or needs closing
+            if abs(delta) >= max(q_step, 1.0) or target_qty == 0 and current_qty != 0:
+                logger.info(f"[{symbol}] Delta detected! Target: {target_qty} | Current: {current_qty}")
+                
+                # Clear tracking state and exchange stops before execution
+                if symbol in self.state:
+                    del self.state[symbol]
+                    self.save_state()
+                self.cancel_symbol_orders(symbol)
+                
+                # Spin up chase execution thread to prevent blocking other assets
+                def run_trade(sym, t_qty, t_dta):
+                    final_pos = self.execute_chase(sym, t_qty)
+                    if final_pos != 0:
+                        self.place_stop_loss(sym, final_pos, t_dta)
+                
+                t = threading.Thread(target=run_trade, args=(symbol, target_qty, t_data))
+                t.start()
+                threads.append(t)
+                
+        # Wait for all executions to finish
+        for t in threads:
+            t.join()
+            
+        logger.info("=== HOURLY SYNC COMPLETE ===")
 
-    def run(self):
-        logger.info("--- PEPE Hunter Started ---")
-        self.ntfy(f"Bot Started. Phase: {self.state['phase']}")
-        self.fetch_specs()
+    def minute_sl_monitor(self):
+        """Locally monitors high/lows and trails the Kraken stop loss via edit_order."""
+        if not self.state: return
+        
+        prices = self.get_current_prices()
+        
+        for symbol, track in list(self.state.items()):
+            px = prices.get(symbol)
+            if not px: continue
+            
+            pos = track["pos"]
+            act_price = track["act_price"]
+            tsl_pct = track["tsl_pct"]
+            sl_id = track.get("sl_order_id")
+            
+            needs_update = False
+            new_stop_px = track["current_sl_price"]
+            
+            if pos > 0:
+                if px > track["highest"]:
+                    track["highest"] = px
+                    if px >= act_price:
+                        calc_sl = self.round_price(symbol, px * (1 - tsl_pct))
+                        if calc_sl > track["current_sl_price"]:
+                            new_stop_px = calc_sl
+                            needs_update = True
+                            
+            elif pos < 0:
+                if px < track["lowest"]:
+                    track["lowest"] = px
+                    if px <= act_price:
+                        calc_sl = self.round_price(symbol, px * (1 + tsl_pct))
+                        if calc_sl < track["current_sl_price"]:
+                            new_stop_px = calc_sl
+                            needs_update = True
+                            
+            if needs_update and sl_id:
+                try:
+                    resp = self.api.edit_order({
+                        "orderId": sl_id,
+                        "stopPrice": new_stop_px
+                    })
+                    if "editStatus" in resp and resp["editStatus"].get("status") == "edited":
+                        # Updated successfully or received new ID
+                        new_id = resp["editStatus"].get("orderId", sl_id)
+                        track["current_sl_price"] = new_stop_px
+                        track["sl_order_id"] = new_id
+                        self.save_state()
+                        logger.info(f"[{symbol}] Trailed SL updated to {new_stop_px}. ID: {new_id}")
+                    else:
+                        logger.warning(f"[{symbol}] SL Edit failed (might have triggered): {resp}")
+                        # If failed, the order might be gone (filled). We should let the hourly sync clean it up, 
+                        # but we can pop it locally so we don't spam API requests.
+                        self.state.pop(symbol, None)
+                        self.save_state()
+                        
+                except Exception as e:
+                    logger.error(f"[{symbol}] Edit Order Exception: {e}")
 
+    def run_forever(self):
+        logger.info("Executor Bot Started.")
+        last_hour = -1
+        
         while True:
             try:
-                # 1. Update Prices
-                self.get_prices()
-                utc_now = datetime.utcnow()
-                current_date = utc_now.strftime("%Y-%m-%d")
-
-                # 2. Safety Checks
-                if self.btc_price < BTC_LO_SHUTDOWN and self.btc_price > 0:
-                    self.emergency_shutdown(f"BTC {self.btc_price} < {BTC_LO_SHUTDOWN}")
+                now = datetime.utcnow()
                 
-                if self.btc_price > BTC_HI_SHUTDOWN:
-                    self.emergency_shutdown(f"BTC {self.btc_price} > {BTC_HI_SHUTDOWN}")
-
-                # 3. Alerts
-                if self.btc_price < BTC_NOTIFY_LEVEL and not self.state["notified_51400"] and self.btc_price > 0:
-                    self.ntfy(f"BTC Breach Alert: {self.btc_price} < {BTC_NOTIFY_LEVEL}")
-                    self.state["notified_51400"] = True
-                    self.save_state()
-
-                # 4. Phase Switching
-                if self.state["phase"] == "sell" and self.btc_price < BTC_PHASE_SWITCH and self.btc_price > 0:
-                    self.ntfy(f"PHASE SWITCH: Selling -> Buying (BTC {self.btc_price})")
-                    self.state["phase"] = "buy"
-                    self.save_state()
-
-                # 5. Execution Check (Startup OR New Day)
-                if self.state["last_trade_date"] != current_date and not self.execution_active:
+                # 1. Run Hourly Sync precisely at minute 1 to allow web app to update
+                if now.minute == 1 and now.hour != last_hour:
+                    self.hourly_sync()
+                    last_hour = now.hour
+                
+                # 2. Run SL monitor the rest of the time
+                else:
+                    self.minute_sl_monitor()
                     
-                    if self.btc_price > 0 and self.pepe_price > 0:
-                        
-                        if self.state["phase"] == "sell" and self.state["days_active"] >= MAX_PHASE_DAYS:
-                            self.state["phase"] = "buy"
-                            self.ntfy("Day 60 Reached. Switching Sell -> Buy.")
-                            self.save_state()
-                        
-                        logger.info(f"Triggering Daily Trade. Date: {current_date}")
-                        self.execution_active = True
-                        self.execution_stage = "START"
-                        self.state["last_trade_date"] = current_date
-                        self.state["days_active"] += 1
-                        self.save_state()
-                    else:
-                        logger.warning("Waiting for price feed...")
-
-                # 6. Run Execution Logic
-                if self.execution_active:
-                    self.perform_execution_logic()
-
-                # 7. Notifications (every 6 hours)
-                if utc_now.hour % 6 == 0 and utc_now.minute == 0:
-                    if time.time() - self.last_notify_ts > 3600:
-                        cur_eq = self.get_account_equity()
-                        pnl = cur_eq - self.state["initial_equity"]
-                        pos = self.get_pos_size(SYMBOL_PEPE)
-                        msg = (f"REPORT | Day: {self.state['days_active']} | Phase: {self.state['phase']}\n"
-                               f"PnL: ${pnl:.2f} | Pos: {pos} | BTC: {self.btc_price}")
-                        self.ntfy(msg)
-                        self.last_notify_ts = time.time()
-
-                time.sleep(5)
-
+                time.sleep(60) # Wake up every minute
+                
             except KeyboardInterrupt:
-                logger.info("Manual Stop.")
-                sys.exit(0)
+                logger.info("Bot Shutdown manually.")
+                break
             except Exception as e:
-                logger.error(f"Loop Error: {e}")
-                time.sleep(30)
+                logger.error(f"Main Loop Error: {e}")
+                time.sleep(60)
 
 if __name__ == "__main__":
-    bot = PepeHunter()
-    bot.run()
+    executor = AppExecutor()
+    executor.run_forever()
